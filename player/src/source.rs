@@ -78,6 +78,12 @@ pub struct Hints {
 
 pub fn probe_hints(video: &str) -> Hints {
     let mut h = Hints::default();
+    // YouTube marks its equi-angular cubemap streams in the stream URL
+    // ("xtags=vproj=mesh"); ffmpeg only reports them as an unknown type.
+    let lower = video.to_ascii_lowercase();
+    if lower.contains("vproj%3dmesh") || lower.contains("vproj=mesh") {
+        h.projection = Some(Projection::Cube360);
+    }
     let Ok(out) = Command::new("/usr/bin/ffprobe")
         .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream_side_data"])
         .args(["-of", "default=nw=1", video])
@@ -86,7 +92,7 @@ pub fn probe_hints(video: &str) -> Hints {
         return h;
     };
     let text = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
-    if text.contains("projection=equirectangular") {
+    if h.projection.is_none() && text.contains("projection=equirectangular") {
         // A partial sphere (bounds set) is almost always 180.
         let bounded = text.lines().any(|l| l.starts_with("bound_left=") && !l.ends_with("=0"));
         h.projection = Some(if bounded { Projection::Dome180 } else { Projection::Sphere360 });

@@ -31,12 +31,17 @@ Play any video page (YouTube and other sites yt-dlp supports):
 in Chromium and drag the button onto the bookmarks bar. On a video page, click
 it; the first time, allow Chromium to open the VR player.
 
-Controls: **A** switches 360 / 180 / flat, **X** switches mono / side-by-side /
-top-bottom 3D, **B** quits. The layout is detected from the video's metadata
-or title, otherwise it starts on a flat screen. Every run writes
+Controls: a panel floats in front of you. Point a controller at it (a white
+dot shows where) and pull the **trigger** to click: seek bar, play/pause,
+skip 10 s, picture type (360 / 360 cube / 180 / flat), 3D layout, recenter
+and quit. Without the panel: **A** or **X** pauses, the **thumbstick**
+left/right skips 10 s, **B** or **Y** (or a trigger pull off the panel) shows
+or hides it. The panel hides itself after 8 seconds of playback. The layout is
+detected from the video's metadata or title, otherwise it starts on a flat
+screen; YouTube's cube-shaped 360 format is recognised automatically. Every run writes
 `~/vr-player.log`; paste it into the project thread if something looks wrong.
 
-Options: `--mode 360|180|flat`, `--stereo mono|sbs|tb`, `--sw` (software
+Options: `--mode 360|cube|180|flat`, `--stereo mono|sbs|tb`, `--sw` (software
 decode, for comparison), `--start SECONDS`, `--max-width N` (default 4096),
 `--screen METERS` (flat screen width).
 

@@ -4,7 +4,8 @@
 //! the codec allows), converts to RGBA and writes raw frames to a pipe. A
 //! reader thread paces those frames to the video's frame rate and writes each
 //! one straight into a GPU-visible staging buffer picked by `FrameSlots`.
-//! Audio is played by a separate `ffplay` process.
+//! Audio is played by a separate `ffplay` process. Seeking restarts both
+//! processes at the new position; pausing holds frames back and freezes ffplay.
 
 use std::{
     collections::HashMap,
@@ -12,7 +13,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -24,6 +25,8 @@ pub struct VideoInfo {
     pub height: u32,
     pub fps: f64,
     pub has_audio: bool,
+    /// Length in seconds, when the container says.
+    pub duration: Option<f64>,
 }
 
 fn tool(name: &str) -> String {
@@ -34,7 +37,7 @@ fn tool(name: &str) -> String {
 pub fn probe(input: &str) -> Result<VideoInfo, String> {
     let out = Command::new(tool("ffprobe"))
         .args(["-v", "error", "-select_streams", "v:0"])
-        .args(["-show_entries", "stream=codec_name,width,height,avg_frame_rate,r_frame_rate"])
+        .args(["-show_entries", "stream=codec_name,width,height,avg_frame_rate,r_frame_rate:format=duration"])
         .args(["-of", "default=nw=1", input])
         .output()
         .map_err(|e| format!("could not run ffprobe: {e}"))?;
@@ -53,6 +56,7 @@ pub fn probe(input: &str) -> Result<VideoInfo, String> {
         width: kv.get("width").and_then(|v| v.parse().ok()).ok_or("no video width")?,
         height: kv.get("height").and_then(|v| v.parse().ok()).ok_or("no video height")?,
         fps: rate("avg_frame_rate").or_else(|| rate("r_frame_rate")).unwrap_or(30.0),
+        duration: kv.get("duration").and_then(|v| v.parse().ok()).filter(|d: &f64| *d > 0.0),
         has_audio: Command::new(tool("ffprobe"))
             .args(["-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", input])
             .output()
@@ -145,6 +149,12 @@ impl FrameSlots {
         s.seq += 1;
     }
 
+    /// Renderer: read the slot returned by `take_latest` (until `release`).
+    pub fn slot(&self, i: usize) -> &[u8] {
+        // SAFETY: guaranteed by `new`; the reader never writes the slot in use.
+        unsafe { std::slice::from_raw_parts(self.ptrs[i] as *const u8, self.frame_bytes) }
+    }
+
     fn slot_mut(&self, i: usize) -> &mut [u8] {
         // SAFETY: guaranteed by `new`; the slot protocol gives the reader
         // exclusive access to slot `i` until it is published.
@@ -152,74 +162,84 @@ impl FrameSlots {
     }
 }
 
-pub struct Playback {
-    video: Child,
-    audio: Option<Child>,
-    stop: Arc<AtomicBool>,
-    pub hw: bool,
+/// How to decode one input; worked out once, then used for every seek.
+pub struct Decoder {
+    input: String,
+    audio_input: Option<String>,
+    filter: String,
+    fps: f64,
+    /// `Some(name)` = hardware decoder, `None` = ffmpeg's software decoder.
+    decoder: Option<&'static str>,
 }
 
-impl Playback {
-    /// Start decoding `input` into `slots`. `pix_fmt` is ffmpeg's name for the
-    /// swapchain's byte order ("rgba" or "bgra").
-    pub fn start(
+impl Decoder {
+    /// Pick the decoder for `input`. `pix_fmt` is ffmpeg's name for the
+    /// texture's byte order ("rgba" or "bgra").
+    pub fn new(
         input: &str,
         audio_input: Option<&str>,
         info: &VideoInfo,
         out: (u32, u32),
         pix_fmt: &str,
         want_hw: bool,
-        start_secs: f64,
-        slots: Arc<FrameSlots>,
     ) -> Result<Self, String> {
-        let filter = format!("scale={}:{}:flags=bilinear,format={pix_fmt}", out.0, out.1);
-        let decode_args = |decoder: Option<&str>| {
-            let mut a: Vec<String> = vec!["-hide_banner".into(), "-nostdin".into()];
-            if start_secs > 0.0 {
-                a.extend(["-ss".into(), format!("{start_secs:.3}")]);
-            }
-            if let Some(d) = decoder {
-                a.extend(["-c:v".into(), d.into()]);
-            }
-            a.extend(["-i".into(), input.into(), "-an".into(), "-sn".into(), "-vf".into(), filter.clone()]);
-            a
+        let mut d = Self {
+            input: input.to_string(),
+            audio_input: audio_input.map(str::to_string),
+            filter: format!("scale={}:{}:flags=bilinear,format={pix_fmt}", out.0, out.1),
+            fps: info.fps,
+            decoder: None,
         };
-
         // Try the hardware decoder first, then software. Each candidate is
         // test-run for one frame with exactly the arguments playback uses, so
         // a failure here is logged with ffmpeg's own message.
-        let output_args = ["-f", "rawvideo"];
-        let mut candidates: Vec<Option<&str>> = Vec::new();
-        if want_hw && let Some(d) = hw_decoder(&info.codec) {
-            candidates.push(Some(d));
+        let mut candidates: Vec<Option<&'static str>> = Vec::new();
+        if want_hw && let Some(hw) = hw_decoder(&info.codec) {
+            candidates.push(Some(hw));
         }
         candidates.push(None);
-        let mut chosen = None;
-        for decoder in candidates {
+        for candidate in candidates {
+            d.decoder = candidate;
             let check = Command::new(tool("ffmpeg"))
                 .args(["-loglevel", "warning"])
-                .args(decode_args(decoder))
-                .args(output_args)
+                .args(d.decode_args(0.0))
                 .args(["-frames:v", "1", "-y", "/dev/null"])
                 .stdin(Stdio::null())
                 .output()
                 .map_err(|e| format!("could not run ffmpeg: {e}"))?;
-            let name = decoder.unwrap_or("software");
             if check.status.success() {
-                chosen = Some(decoder);
-                break;
+                return Ok(d);
             }
-            eprintln!("video: decoder {name} failed its test. ffmpeg said:");
+            eprintln!("video: decoder {} failed its test. ffmpeg said:", candidate.unwrap_or("software"));
             for line in String::from_utf8_lossy(&check.stderr).lines().take(20) {
                 eprintln!("    {line}");
             }
         }
-        let decoder = chosen.ok_or("ffmpeg could not decode this video (see messages above)")?;
+        Err("ffmpeg could not decode this video (see messages above)".into())
+    }
 
+    pub fn is_hw(&self) -> bool {
+        self.decoder.is_some()
+    }
+
+    fn decode_args(&self, start_secs: f64) -> Vec<String> {
+        let mut a: Vec<String> = vec!["-hide_banner".into(), "-nostdin".into()];
+        if start_secs > 0.0 {
+            a.extend(["-ss".into(), format!("{start_secs:.3}")]);
+        }
+        if let Some(d) = self.decoder {
+            a.extend(["-c:v".into(), d.into()]);
+        }
+        a.extend(["-i".into(), self.input.clone(), "-an".into(), "-sn".into(), "-vf".into(), self.filter.clone()]);
+        a.extend(["-f".into(), "rawvideo".into()]);
+        a
+    }
+
+    /// Start playing at `start_secs`, writing frames into `slots`.
+    pub fn start(&self, start_secs: f64, slots: Arc<FrameSlots>, paused: bool) -> Result<Playback, String> {
         let mut cmd = Command::new(tool("ffmpeg"));
         cmd.args(["-loglevel", "warning"])
-            .args(decode_args(decoder))
-            .args(output_args)
+            .args(self.decode_args(start_secs))
             .arg("pipe:1")
             .stdout(Stdio::piped())
             .stdin(Stdio::null());
@@ -227,7 +247,7 @@ impl Playback {
         let mut video = cmd.spawn().map_err(|e| format!("could not run ffmpeg: {e}"))?;
         let mut pipe = video.stdout.take().unwrap();
 
-        let audio = if let Some(audio_input) = audio_input {
+        let audio = if let Some(audio_input) = &self.audio_input {
             let mut a = Command::new(tool("ffplay"));
             a.args(["-nodisp", "-autoexit", "-loglevel", "error"]);
             if start_secs > 0.0 {
@@ -242,20 +262,23 @@ impl Playback {
                 }
             }
         } else {
-            eprintln!("audio: this video has no sound track");
             None
         };
 
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_r = stop.clone();
-        let frame_time = Duration::from_secs_f64(1.0 / info.fps.clamp(1.0, 240.0));
-        thread::spawn(move || {
-            let t0 = Instant::now();
+        let shared = Arc::new(Shared::default());
+        shared.paused.store(paused, Ordering::Relaxed);
+        let s = shared.clone();
+        let frame_time = Duration::from_secs_f64(1.0 / self.fps.clamp(1.0, 240.0));
+        let reader = thread::spawn(move || {
+            let mut t0 = Instant::now();
             let mut n: u32 = 0;
-            while !stop_r.load(Ordering::Relaxed) {
+            while !s.stop.load(Ordering::Relaxed) {
                 let i = slots.free_slot();
                 if let Err(e) = pipe.read_exact(slots.slot_mut(i)) {
-                    eprintln!("video: decoder stream ended after {n} frames ({e})");
+                    if !s.stop.load(Ordering::Relaxed) {
+                        eprintln!("video: decoder stream ended after {n} frames ({e})");
+                        s.ended.store(true, Ordering::Relaxed);
+                    }
                     break;
                 }
                 let due = t0 + frame_time * n;
@@ -270,21 +293,125 @@ impl Playback {
                     eprintln!("video: first frame decoded after {:.2}s", t0.elapsed().as_secs_f64());
                 }
                 n += 1;
+                s.frames.store(n as u64, Ordering::Relaxed);
+                // While paused, hold the next frame back and shift the clock.
+                let paused_at = Instant::now();
+                while s.paused.load(Ordering::Relaxed) && !s.stop.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                t0 += paused_at.elapsed();
             }
         });
 
-        Ok(Self { video, audio, stop, hw: decoder.is_some() })
+        let p = Playback { video, audio, shared, reader: Some(reader), start_secs, fps: self.fps };
+        if paused {
+            p.signal_audio("-STOP");
+        }
+        Ok(p)
+    }
+}
+
+#[derive(Default)]
+struct Shared {
+    stop: AtomicBool,
+    paused: AtomicBool,
+    ended: AtomicBool,
+    frames: AtomicU64,
+}
+
+pub struct Playback {
+    video: Child,
+    audio: Option<Child>,
+    shared: Arc<Shared>,
+    reader: Option<thread::JoinHandle<()>>,
+    start_secs: f64,
+    fps: f64,
+}
+
+impl Playback {
+    /// Seconds into the video of the frame on screen.
+    pub fn position(&self) -> f64 {
+        let n = self.shared.frames.load(Ordering::Relaxed).saturating_sub(1);
+        self.start_secs + n as f64 / self.fps.max(1.0)
+    }
+
+    pub fn ended(&self) -> bool {
+        self.shared.ended.load(Ordering::Relaxed)
+    }
+
+    pub fn paused(&self) -> bool {
+        self.shared.paused.load(Ordering::Relaxed)
+    }
+
+    pub fn set_paused(&mut self, paused: bool) {
+        if self.paused() != paused {
+            self.shared.paused.store(paused, Ordering::Relaxed);
+            self.signal_audio(if paused { "-STOP" } else { "-CONT" });
+        }
+    }
+
+    /// Freeze or continue the audio player (ffplay has no pause command on a pipe).
+    fn signal_audio(&self, signal: &str) {
+        if let Some(a) = &self.audio {
+            let _ = Command::new("kill").arg(signal).arg(a.id().to_string()).status();
+        }
+    }
+
+    /// Stop decoding and sound; safe to call more than once.
+    pub fn stop(&mut self) {
+        self.shared.stop.store(true, Ordering::Relaxed);
+        let _ = self.video.kill();
+        let _ = self.video.wait();
+        if let Some(mut a) = self.audio.take() {
+            let _ = Command::new("kill").arg("-CONT").arg(a.id().to_string()).status();
+            let _ = a.kill();
+            let _ = a.wait();
+        }
+        if let Some(r) = self.reader.take() {
+            let _ = r.join();
+        }
     }
 }
 
 impl Drop for Playback {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        let _ = self.video.kill();
-        let _ = self.video.wait();
-        if let Some(a) = &mut self.audio {
-            let _ = a.kill();
-            let _ = a.wait();
-        }
+        self.stop();
     }
+}
+
+/// Whether a decoded 360 frame looks like YouTube's equi-angular cubemap
+/// (EAC: six cube faces in a 3x2 grid) rather than equirectangular. In EAC
+/// the two rows of faces meet at the middle of the picture with a hard
+/// edge, while an equirectangular picture is continuous at its horizon.
+/// `None` when the frame has too little detail to tell (black, fades).
+pub fn looks_like_eac(px: &[u8], w: usize, h: usize) -> Option<bool> {
+    if w < 64 || h < 64 || px.len() < w * h * 4 {
+        return None;
+    }
+    let pixel = |x: usize, y: usize| &px[(y * w + x) * 4..(y * w + x) * 4 + 3];
+    let diff = |a: &[u8], b: &[u8]| a.iter().zip(b).map(|(p, q)| p.abs_diff(*q) as f64).sum::<f64>() / 3.0;
+    let row_diff = |y0: usize, y1: usize| (0..w).step_by(2).map(|x| diff(pixel(x, y0), pixel(x, y1))).sum::<f64>() / (w / 2) as f64;
+
+    // Detail: average difference between neighbouring samples across the frame.
+    let detail = (1..16)
+        .map(|k| row_diff(h * k / 16, h * k / 16 + 2))
+        .sum::<f64>()
+        / 15.0;
+    if detail < 1.0 {
+        return None;
+    }
+    let mid = h / 2;
+    let seam = row_diff(mid - 1, mid);
+    let normal = (row_diff(mid - 8, mid - 7) + row_diff(mid - 7, mid - 6) + row_diff(mid + 6, mid + 7) + row_diff(mid + 7, mid + 8)) / 4.0;
+    // Top-bottom 3D also has an edge in the middle, but its halves match.
+    let halves = (0..32)
+        .flat_map(|j| (0..32).map(move |i| (i, j)))
+        .map(|(i, j)| {
+            let (x, y) = (w * (2 * i + 1) / 64, mid * (2 * j + 1) / 64);
+            diff(pixel(x, y), pixel(x, y + mid))
+        })
+        .sum::<f64>()
+        / 1024.0;
+    eprintln!("video: layout check: seam {seam:.1}, normal {normal:.1}, halves differ by {halves:.1}");
+    Some(seam > 2.5 * normal + 3.0 && halves > 12.0)
 }

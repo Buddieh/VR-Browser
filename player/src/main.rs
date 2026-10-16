@@ -3,13 +3,20 @@
 //! Decoded frames are uploaded to a texture, and every frame each eye is drawn
 //! with one full-screen triangle whose fragment shader turns the pixel's view
 //! ray into a position on the video: an equirectangular sphere (360), a
-//! hemisphere (180) or a flat screen. SteamVR on the Frame has no equirect
-//! composition layers, so the app does this projection itself.
+//! hemisphere (180), YouTube's cubemap or a flat screen. SteamVR on the Frame
+//! has no equirect composition layers, so the app does this projection itself.
+//! A control panel (ui.rs) floats in front of the viewer as a quad layer.
 
 mod source;
+mod ui;
 mod video;
 
-use std::{ffi::CStr, io::Cursor, sync::Arc, time::Duration};
+use std::{
+    ffi::CStr,
+    io::Cursor,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use ash::vk::{self, Handle};
 use openxr as xr;
@@ -17,8 +24,30 @@ use openxr as xr;
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Projection {
     Sphere360,
+    /// YouTube's equi-angular cubemap (EAC).
+    Cube360,
     Dome180,
     Flat,
+}
+
+impl Projection {
+    fn next(self) -> Self {
+        match self {
+            Projection::Sphere360 => Projection::Cube360,
+            Projection::Cube360 => Projection::Dome180,
+            Projection::Dome180 => Projection::Flat,
+            Projection::Flat => Projection::Sphere360,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Projection::Sphere360 => "360",
+            Projection::Cube360 => "360 cube",
+            Projection::Dome180 => "180",
+            Projection::Flat => "Flat",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -26,6 +55,24 @@ enum Stereo {
     Mono,
     SideBySide,
     TopBottom,
+}
+
+impl Stereo {
+    fn next(self) -> Self {
+        match self {
+            Stereo::Mono => Stereo::SideBySide,
+            Stereo::SideBySide => Stereo::TopBottom,
+            Stereo::TopBottom => Stereo::Mono,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Stereo::Mono => "Off",
+            Stereo::SideBySide => "SBS",
+            Stereo::TopBottom => "TB",
+        }
+    }
 }
 
 struct Args {
@@ -39,15 +86,15 @@ struct Args {
     screen_m: f32,
 }
 
-const USAGE: &str = "usage: vr-player <file-or-url> [--mode 360|180|flat] [--stereo mono|sbs|tb] \
+const USAGE: &str = "usage: vr-player <file-or-url> [--mode 360|cube|180|flat] [--stereo mono|sbs|tb] \
 [--sw] [--max-width N] [--start SECONDS] [--screen METERS]
 
 The input can be a video file, a direct video URL, or a web page (YouTube and
 other sites supported by yt-dlp). Without --mode/--stereo the layout is
 detected from the video's metadata or title.
 
-Controls: A = cycle 360 / 180 / flat, X = cycle mono / side-by-side / top-bottom,
-B or Y = quit";
+Controls: point at the panel and pull the trigger to click. A or X = pause,
+thumbstick left/right = skip 10 seconds, B or Y = show or hide the panel.";
 
 const VIEW_TYPE: xr::ViewConfigurationType = xr::ViewConfigurationType::PRIMARY_STEREO;
 
@@ -68,6 +115,7 @@ fn parse_args() -> Result<Args, String> {
             "--mode" => {
                 a.projection = Some(match val("--mode")?.as_str() {
                     "360" => Projection::Sphere360,
+                    "cube" | "eac" => Projection::Cube360,
                     "180" => Projection::Dome180,
                     "flat" => Projection::Flat,
                     m => return Err(format!("unknown mode {m}")),
@@ -141,6 +189,75 @@ fn rotation_rows(q: xr::Quaternionf) -> [[f32; 4]; 3] {
     ]
 }
 
+fn quat_mul(a: xr::Quaternionf, b: xr::Quaternionf) -> xr::Quaternionf {
+    xr::Quaternionf {
+        x: a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        y: a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        z: a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+        w: a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+    }
+}
+
+fn quat_inv(q: xr::Quaternionf) -> xr::Quaternionf {
+    xr::Quaternionf { x: -q.x, y: -q.y, z: -q.z, w: q.w }
+}
+
+fn rotate(q: xr::Quaternionf, v: xr::Vector3f) -> xr::Vector3f {
+    // v + 2w(u x v) + 2u x (u x v), with u the quaternion's vector part
+    let cross = |a: [f32; 3], b: [f32; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    let u = [q.x, q.y, q.z];
+    let t = cross(u, [v.x, v.y, v.z]).map(|c| 2.0 * c);
+    let ut = cross(u, t);
+    xr::Vector3f { x: v.x + q.w * t[0] + ut[0], y: v.y + q.w * t[1] + ut[1], z: v.z + q.w * t[2] + ut[2] }
+}
+
+fn add(a: xr::Vector3f, b: xr::Vector3f) -> xr::Vector3f {
+    xr::Vector3f { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z }
+}
+
+/// The turn around the vertical axis that faces where `q` looks.
+fn yaw_of(q: xr::Quaternionf) -> xr::Quaternionf {
+    let f = rotate(q, xr::Vector3f { x: 0.0, y: 0.0, z: -1.0 });
+    let a = (-f.x).atan2(-f.z);
+    xr::Quaternionf { x: 0.0, y: (a / 2.0).sin(), z: 0.0, w: (a / 2.0).cos() }
+}
+
+/// Where a controller's pointing ray meets the panel, in panel pixels.
+fn panel_hit(panel: xr::Posef, aim: xr::Posef) -> Option<(f32, f32)> {
+    let inv = quat_inv(panel.orientation);
+    let rel = xr::Vector3f {
+        x: aim.position.x - panel.position.x,
+        y: aim.position.y - panel.position.y,
+        z: aim.position.z - panel.position.z,
+    };
+    let o = rotate(inv, rel);
+    let d = rotate(inv, rotate(aim.orientation, xr::Vector3f { x: 0.0, y: 0.0, z: -1.0 }));
+    if d.z >= -1e-4 || o.z <= 0.0 {
+        return None; // pointing away, or behind the panel
+    }
+    let t = -o.z / d.z;
+    let (u, v) = ((o.x + t * d.x) / ui::WIDTH_M + 0.5, 0.5 - (o.y + t * d.y) / ui::HEIGHT_M);
+    ((0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v)).then(|| (u * ui::W as f32, v * ui::H as f32))
+}
+
+/// Restart playback at `target` seconds, keeping it paused if it was.
+fn seek(
+    decoder: &video::Decoder,
+    playback: &mut video::Playback,
+    slots: &Arc<video::FrameSlots>,
+    target: f64,
+    duration: Option<f64>,
+) {
+    let target = target.clamp(0.0, duration.map(|d| (d - 1.0).max(0.0)).unwrap_or(f64::MAX));
+    let paused = playback.paused() && !playback.ended();
+    eprintln!("input: seek to {target:.1}s");
+    playback.stop();
+    match decoder.start(target, slots.clone(), paused) {
+        Ok(p) => *playback = p,
+        Err(e) => eprintln!("video: could not seek: {e}"),
+    }
+}
+
 /// Which part of the video each eye sees: (x, y, w, h) in texture coordinates.
 fn eye_rect(stereo: Stereo, eye: usize) -> [f32; 4] {
     let e = eye as f32;
@@ -166,6 +283,11 @@ fn run(args: Args) -> Result<(), String> {
     let named = source::guess_from_name(&src.title);
     let mut projection = args.projection.or(meta.projection).or(named.projection).unwrap_or(Projection::Flat);
     let mut stereo = args.stereo.or(meta.stereo).or(named.stereo).unwrap_or(Stereo::Mono);
+    // A guessed 360 (or untagged web video) may really be YouTube's cubemap;
+    // the first detailed frames decide.
+    let mut check_cube = args.projection.is_none()
+        && meta.projection.is_none()
+        && (projection == Projection::Sphere360 || (projection == Projection::Flat && src.audio.is_some()));
     eprintln!(
         "video: {} {}x{} @ {:.2} fps -> {}x{}, {:?} {:?}",
         info.codec, info.width, info.height, info.fps, width, height, projection, stereo
@@ -279,41 +401,54 @@ fn run(args: Args) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
 
         let actions = instance.create_action_set("player", "Player", 0).map_err(|e| e.to_string())?;
-        let quit = actions.create_action::<bool>("quit", "Quit", &[]).map_err(|e| e.to_string())?;
-        let cycle = actions.create_action::<bool>("cycle", "Cycle 360/180/flat", &[]).map_err(|e| e.to_string())?;
-        let cycle_stereo =
-            actions.create_action::<bool>("stereo", "Cycle mono/SBS/TB", &[]).map_err(|e| e.to_string())?;
         let path = |p: &str| instance.string_to_path(p).unwrap();
-        for (profile, quit_paths, cycle_path, stereo_path) in [
+        let hands = [path("/user/hand/left"), path("/user/hand/right")];
+        let act = |name: &str, label: &str| actions.create_action::<bool>(name, label, &[]).map_err(|e| e.to_string());
+        let select = actions.create_action::<bool>("select", "Click", &hands).map_err(|e| e.to_string())?;
+        let aim = actions.create_action::<xr::Posef>("aim", "Pointer", &hands).map_err(|e| e.to_string())?;
+        let pause = act("pause", "Play or pause")?;
+        let menu = act("menu", "Show or hide the panel")?;
+        let stick = actions.create_action::<xr::Vector2f>("skip", "Skip 10 seconds", &[]).map_err(|e| e.to_string())?;
+        // (profile, select, pause, menu, thumbstick); paths are per hand.
+        for (profile, select_in, pause_in, menu_in, stick_in) in [
             (
                 "/interaction_profiles/oculus/touch_controller",
-                &["/user/hand/right/input/b/click", "/user/hand/left/input/y/click"][..],
-                "/user/hand/right/input/a/click",
-                Some("/user/hand/left/input/x/click"),
+                "trigger/value",
+                &["right/input/a/click", "left/input/x/click"][..],
+                &["right/input/b/click", "left/input/y/click"][..],
+                Some("thumbstick"),
             ),
             (
                 "/interaction_profiles/valve/index_controller",
-                &["/user/hand/right/input/b/click", "/user/hand/left/input/b/click"][..],
-                "/user/hand/right/input/a/click",
-                Some("/user/hand/left/input/a/click"),
+                "trigger/click",
+                &["right/input/a/click", "left/input/a/click"][..],
+                &["right/input/b/click", "left/input/b/click"][..],
+                Some("thumbstick"),
             ),
-            (
-                "/interaction_profiles/khr/simple_controller",
-                &["/user/hand/right/input/menu/click"][..],
-                "/user/hand/right/input/select/click",
-                Some("/user/hand/left/input/select/click"),
-            ),
+            ("/interaction_profiles/khr/simple_controller", "select/click", &[][..], &["right/input/menu/click"][..], None),
         ] {
-            let mut b: Vec<xr::Binding> = quit_paths.iter().map(|p| xr::Binding::new(&quit, path(p))).collect();
-            b.push(xr::Binding::new(&cycle, path(cycle_path)));
-            if let Some(sp) = stereo_path {
-                b.push(xr::Binding::new(&cycle_stereo, path(sp)));
+            let mut b = Vec::new();
+            for hand in ["left", "right"] {
+                b.push(xr::Binding::new(&select, path(&format!("/user/hand/{hand}/input/{select_in}"))));
+                b.push(xr::Binding::new(&aim, path(&format!("/user/hand/{hand}/input/aim/pose"))));
+                if let Some(st) = stick_in {
+                    b.push(xr::Binding::new(&stick, path(&format!("/user/hand/{hand}/input/{st}"))));
+                }
             }
+            b.extend(pause_in.iter().map(|p| xr::Binding::new(&pause, path(&format!("/user/hand/{p}")))));
+            b.extend(menu_in.iter().map(|p| xr::Binding::new(&menu, path(&format!("/user/hand/{p}")))));
             if let Err(e) = instance.suggest_interaction_profile_bindings(path(profile), &b) {
                 eprintln!("input: bindings for {profile} rejected: {e}");
             }
         }
         session.attach_action_sets(&[&actions]).map_err(|e| e.to_string())?;
+        let aim_spaces = [
+            aim.create_space(&session, hands[0], xr::Posef::IDENTITY).map_err(|e| e.to_string())?,
+            aim.create_space(&session, hands[1], xr::Posef::IDENTITY).map_err(|e| e.to_string())?,
+        ];
+        let head = session
+            .create_reference_space(xr::ReferenceSpaceType::VIEW, xr::Posef::IDENTITY)
+            .map_err(|e| e.to_string())?;
 
         // --- Eye swapchain (2 array layers, one per eye) ----------------------------
         let formats = session.enumerate_swapchain_formats().map_err(|e| e.to_string())?;
@@ -406,6 +541,57 @@ fn run(args: Args) -> Result<(), String> {
             }
             framebuffers.push(per_eye);
         }
+
+        // --- Control panel: its own swapchain, filled by copies from a mapped buffer ---
+        let mut panel_swapchain = session
+            .create_swapchain(&xr::SwapchainCreateInfo {
+                create_flags: xr::SwapchainCreateFlags::EMPTY,
+                usage_flags: xr::SwapchainUsageFlags::COLOR_ATTACHMENT
+                    | xr::SwapchainUsageFlags::TRANSFER_DST
+                    | xr::SwapchainUsageFlags::SAMPLED,
+                format: color_format.as_raw() as _,
+                sample_count: 1,
+                width: ui::W as u32,
+                height: ui::H as u32,
+                face_count: 1,
+                array_size: 1,
+                mip_count: 1,
+            })
+            .map_err(|e| format!("could not create panel swapchain: {e}"))?;
+        let panel_images: Vec<vk::Image> = panel_swapchain
+            .enumerate_images()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(vk::Image::from_raw)
+            .collect();
+        let panel_bytes = ui::W * ui::H * 4;
+        let panel_buffer = device
+            .create_buffer(
+                &vk::BufferCreateInfo::default().size(panel_bytes as u64).usage(vk::BufferUsageFlags::TRANSFER_SRC),
+                None,
+            )
+            .map_err(vkerr)?;
+        let panel_memory = {
+            let req = device.get_buffer_memory_requirements(panel_buffer);
+            let type_index = find_memory(
+                &mem_props,
+                req.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )
+            .ok_or("no host-visible memory")?;
+            device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(type_index),
+                    None,
+                )
+                .map_err(vkerr)?
+        };
+        device.bind_buffer_memory(panel_buffer, panel_memory, 0).map_err(vkerr)?;
+        let panel_pixels = std::slice::from_raw_parts_mut(
+            device.map_memory(panel_memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()).map_err(vkerr)? as *mut u8,
+            panel_bytes,
+        );
+        let panel = ui::Panel::new(color_format == vk::Format::B8G8R8A8_SRGB);
 
         // --- Video texture --------------------------------------------------------
         let tex_format = vk::Format::R8G8B8A8_SRGB;
@@ -621,17 +807,11 @@ fn run(args: Args) -> Result<(), String> {
             .map_err(vkerr)?[0];
         let fence = device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(vkerr)?;
 
-        let playback = video::Playback::start(
-            &src.video,
-            audio.as_deref(),
-            &info,
-            (width, height),
-            "rgba",
-            args.hw,
-            args.start,
-            slots.clone(),
-        )?;
-        eprintln!("video: decoding with {}", if playback.hw { "hardware (iris)" } else { "software" });
+        let decoder = video::Decoder::new(&src.video, audio.as_deref(), &info, (width, height), "rgba", args.hw)?;
+        eprintln!("video: decoding with {}", if decoder.is_hw() { "hardware (iris)" } else { "software" });
+        let mut playback = decoder.start(args.start, slots.clone(), false)?;
+        let duration = info.duration;
+        let title = if src.title.is_empty() { args.input.clone() } else { src.title.clone() };
 
         // --- Main loop -------------------------------------------------------------
         let mut events = xr::EventDataBuffer::new();
@@ -641,7 +821,21 @@ fn run(args: Args) -> Result<(), String> {
         let mut have_frame = false;
         let mut texture_layout = vk::ImageLayout::UNDEFINED;
         let mut frames_uploaded: u64 = 0;
-        let started = std::time::Instant::now();
+        let started = Instant::now();
+        // Turn applied to the video so "Recenter" puts its front where you look.
+        let mut recenter = xr::Quaternionf { x: 0.0, y: 0.0, z: 0.0, w: 1.0 };
+        let mut panel_shown = true;
+        let mut panel_pose: Option<xr::Posef> = None;
+        // What the panel swapchain holds; None until the first draw.
+        let mut panel_view: Option<ui::View> = None;
+        let mut last_activity = Instant::now();
+        let mut stick_latched = false;
+        let mut was_ended = false;
+        let tracked = xr::SpaceLocationFlags::ORIENTATION_VALID | xr::SpaceLocationFlags::POSITION_VALID;
+        let place_panel = |head: xr::Posef| {
+            let yaw = yaw_of(head.orientation);
+            xr::Posef { orientation: yaw, position: add(head.position, rotate(yaw, xr::Vector3f { x: 0.0, y: -0.3, z: -1.3 })) }
+        };
 
         'main: loop {
             while let Some(event) = instance.poll_event(&mut events).map_err(|e| e.to_string())? {
@@ -672,32 +866,116 @@ fn run(args: Args) -> Result<(), String> {
 
             let state = frame_wait.wait().map_err(|e| e.to_string())?;
             frame_stream.begin().map_err(|e| e.to_string())?;
+            let now = state.predicted_display_time;
 
+            // --- Input ---------------------------------------------------------------
             session.sync_actions(&[(&actions).into()]).map_err(|e| e.to_string())?;
-            let pressed = |a: &xr::Action<bool>| {
-                a.state(&session, xr::Path::NULL)
+            let pressed = |a: &xr::Action<bool>, hand: xr::Path| {
+                a.state(&session, hand)
                     .map(|s| s.is_active && s.changed_since_last_sync && s.current_state)
                     .unwrap_or(false)
             };
-            if pressed(&quit) && !quitting {
-                quitting = true;
-                let _ = session.request_exit();
+            let head_pose = head.locate(&space, now).ok().filter(|l| l.location_flags.contains(tracked)).map(|l| l.pose);
+            if panel_shown && panel_pose.is_none() {
+                panel_pose = head_pose.map(place_panel);
             }
-            if pressed(&cycle) {
-                projection = match projection {
-                    Projection::Sphere360 => Projection::Dome180,
-                    Projection::Dome180 => Projection::Flat,
-                    Projection::Flat => Projection::Sphere360,
-                };
-                eprintln!("input: projection {projection:?}");
+            let mut pointers = [None, None];
+            if panel_shown && let Some(pp) = panel_pose {
+                for (hand, aim_space) in aim_spaces.iter().enumerate() {
+                    if let Ok(l) = aim_space.locate(&space, now)
+                        && l.location_flags.contains(tracked)
+                    {
+                        pointers[hand] = panel_hit(pp, l.pose);
+                    }
+                }
             }
-            if pressed(&cycle_stereo) {
-                stereo = match stereo {
-                    Stereo::Mono => Stereo::SideBySide,
-                    Stereo::SideBySide => Stereo::TopBottom,
-                    Stereo::TopBottom => Stereo::Mono,
-                };
-                eprintln!("input: stereo {stereo:?}");
+            if pointers.iter().any(Option::is_some) {
+                last_activity = Instant::now();
+            }
+            let hover = pointers.iter().flatten().find_map(|&(x, y)| ui::hit(x, y));
+
+            let mut commands = Vec::new();
+            let mut toggle_panel = pressed(&menu, xr::Path::NULL);
+            for (hand, path) in hands.iter().enumerate() {
+                if pressed(&select, *path) {
+                    match pointers[hand] {
+                        Some((x, y)) => commands.extend(ui::hit(x, y)),
+                        // Clicking anywhere off the panel shows or hides it.
+                        None => toggle_panel = true,
+                    }
+                }
+            }
+            if pressed(&pause, xr::Path::NULL) {
+                commands.push(ui::Control::PlayPause);
+            }
+            let stick_x = stick
+                .state(&session, xr::Path::NULL)
+                .map(|s| if s.is_active { s.current_state.x } else { 0.0 })
+                .unwrap_or(0.0);
+            if !stick_latched && stick_x.abs() > 0.7 {
+                stick_latched = true;
+                commands.push(if stick_x > 0.0 { ui::Control::Forward } else { ui::Control::Back });
+            } else if stick_x.abs() < 0.3 {
+                stick_latched = false;
+            }
+            if toggle_panel {
+                panel_shown = !panel_shown;
+                if panel_shown {
+                    panel_pose = head_pose.map(place_panel).or(panel_pose);
+                }
+                last_activity = Instant::now();
+            }
+            for command in commands {
+                last_activity = Instant::now();
+                let pos = playback.position();
+                match command {
+                    ui::Control::Back => seek(&decoder, &mut playback, &slots, pos - 10.0, duration),
+                    ui::Control::Forward => seek(&decoder, &mut playback, &slots, pos + 10.0, duration),
+                    ui::Control::Seek(f) => {
+                        if let Some(d) = duration {
+                            seek(&decoder, &mut playback, &slots, f as f64 * d, duration);
+                        }
+                    }
+                    ui::Control::PlayPause => {
+                        if playback.ended() {
+                            seek(&decoder, &mut playback, &slots, 0.0, duration);
+                        } else {
+                            let paused = !playback.paused();
+                            playback.set_paused(paused);
+                            eprintln!("input: {}", if paused { "paused" } else { "playing" });
+                        }
+                    }
+                    ui::Control::Picture => {
+                        projection = projection.next();
+                        check_cube = false;
+                        eprintln!("input: projection {projection:?}");
+                    }
+                    ui::Control::Stereo => {
+                        stereo = stereo.next();
+                        eprintln!("input: stereo {stereo:?}");
+                    }
+                    ui::Control::Recenter => {
+                        if let Some(h) = head_pose {
+                            recenter = yaw_of(h.orientation);
+                            panel_pose = Some(place_panel(h));
+                        }
+                    }
+                    ui::Control::Quit => {
+                        if !quitting {
+                            quitting = true;
+                            let _ = session.request_exit();
+                        }
+                    }
+                }
+            }
+            // Show the panel when the video ends; hide it after a while of no use.
+            if playback.ended() && !was_ended {
+                panel_shown = true;
+                panel_pose = head_pose.map(place_panel).or(panel_pose);
+            }
+            was_ended = playback.ended();
+            if panel_shown && !playback.paused() && !playback.ended() && last_activity.elapsed() > Duration::from_secs(8) {
+                panel_shown = false;
             }
 
             let new_frame = slots.take_latest(last_seq);
@@ -705,15 +983,11 @@ fn run(args: Args) -> Result<(), String> {
                 if new_frame.is_some() {
                     slots.release();
                 }
-                frame_stream
-                    .end(state.predicted_display_time, blend_mode, &[])
-                    .map_err(|e| e.to_string())?;
+                frame_stream.end(now, blend_mode, &[]).map_err(|e| e.to_string())?;
                 continue;
             }
 
-            let (_, views) = session
-                .locate_views(VIEW_TYPE, state.predicted_display_time, &space)
-                .map_err(|e| e.to_string())?;
+            let (_, views) = session.locate_views(VIEW_TYPE, now, &space).map_err(|e| e.to_string())?;
             let index = swapchain.acquire_image().map_err(|e| e.to_string())? as usize;
             swapchain.wait_image(xr::Duration::INFINITE).map_err(|e| e.to_string())?;
 
@@ -726,6 +1000,19 @@ fn run(args: Args) -> Result<(), String> {
 
             if let Some((slot, seq)) = new_frame {
                 last_seq = seq;
+                if check_cube && frames_uploaded % 15 == 0 {
+                    match video::looks_like_eac(slots.slot(slot), width as usize, height as usize) {
+                        Some(cube) => {
+                            check_cube = false;
+                            if cube {
+                                projection = Projection::Cube360;
+                                eprintln!("video: picture looks like YouTube's 360 cubemap");
+                            }
+                        }
+                        None if frames_uploaded > 900 => check_cube = false,
+                        None => {}
+                    }
+                }
                 upload_frame(&device, cmd, stages[slot].0, texture, texture_layout, width, height);
                 texture_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
                 have_frame = true;
@@ -738,6 +1025,30 @@ fn run(args: Args) -> Result<(), String> {
                 }
             }
 
+            // Redraw the panel only when what it shows has changed.
+            let mut panel_acquired = false;
+            if panel_shown && panel_pose.is_some() {
+                let view = ui::View {
+                    title: title.clone(),
+                    position: playback.position() as u32,
+                    duration: duration.map(|d| d as u32),
+                    paused: playback.paused(),
+                    ended: playback.ended(),
+                    picture: projection.label(),
+                    stereo: stereo.label(),
+                    hover,
+                    cursors: pointers.iter().flatten().map(|&(x, y)| (x as i32, y as i32)).collect(),
+                };
+                if panel_view.as_ref() != Some(&view) {
+                    let i = panel_swapchain.acquire_image().map_err(|e| e.to_string())? as usize;
+                    panel_swapchain.wait_image(xr::Duration::INFINITE).map_err(|e| e.to_string())?;
+                    panel.draw(&view, panel_pixels);
+                    upload_panel(&device, cmd, panel_buffer, panel_images[i]);
+                    panel_acquired = true;
+                    panel_view = Some(view);
+                }
+            }
+
             let video_aspect = {
                 let r = eye_rect(stereo, 0);
                 (width as f32 * r[2]) / (height as f32 * r[3]).max(1.0)
@@ -746,17 +1057,20 @@ fn run(args: Args) -> Result<(), String> {
                 Projection::Sphere360 => 0.0,
                 Projection::Dome180 => 1.0,
                 Projection::Flat => 2.0,
+                Projection::Cube360 => 3.0,
             };
+            let unturn = quat_inv(recenter);
             for (eye, view) in views.iter().enumerate().take(2) {
+                let pos = rotate(unturn, view.pose.position);
                 let c = EyeConstants {
-                    rot: rotation_rows(view.pose.orientation),
+                    rot: rotation_rows(quat_mul(unturn, view.pose.orientation)),
                     tans: [
                         view.fov.angle_left.tan(),
                         view.fov.angle_right.tan(),
                         view.fov.angle_up.tan(),
                         view.fov.angle_down.tan(),
                     ],
-                    pos: [view.pose.position.x, view.pose.position.y, view.pose.position.z, 0.0],
+                    pos: [pos.x, pos.y, pos.z, 0.0],
                     rect: eye_rect(stereo, eye),
                     params: [mode, args.screen_m, args.screen_m / video_aspect, args.screen_m],
                 };
@@ -804,6 +1118,9 @@ fn run(args: Args) -> Result<(), String> {
                 slots.release();
             }
             swapchain.release_image().map_err(|e| e.to_string())?;
+            if panel_acquired {
+                panel_swapchain.release_image().map_err(|e| e.to_string())?;
+            }
 
             let rect = xr::Rect2Di {
                 offset: xr::Offset2Di { x: 0, y: 0 },
@@ -822,19 +1139,31 @@ fn run(args: Args) -> Result<(), String> {
                         )
                 })
                 .collect();
-            frame_stream
-                .end(
-                    state.predicted_display_time,
-                    blend_mode,
-                    &[&xr::CompositionLayerProjection::new().space(&space).views(&projection_views)],
-                )
-                .map_err(|e| e.to_string())?;
+            let projection_layer = xr::CompositionLayerProjection::new().space(&space).views(&projection_views);
+            let quad_layer;
+            let mut layers: Vec<&xr::CompositionLayerBase<xr::Vulkan>> = Vec::new();
+            layers.push(&projection_layer);
+            if panel_shown && panel_view.is_some() && let Some(pose) = panel_pose {
+                quad_layer = xr::CompositionLayerQuad::new()
+                    .space(&space)
+                    .eye_visibility(xr::EyeVisibility::BOTH)
+                    .sub_image(xr::SwapchainSubImage::new().swapchain(&panel_swapchain).image_rect(xr::Rect2Di {
+                        offset: xr::Offset2Di { x: 0, y: 0 },
+                        extent: xr::Extent2Di { width: ui::W as i32, height: ui::H as i32 },
+                    }))
+                    .pose(pose)
+                    .size(xr::Extent2Df { width: ui::WIDTH_M, height: ui::HEIGHT_M });
+                layers.push(&quad_layer);
+            }
+            frame_stream.end(now, blend_mode, &layers).map_err(|e| e.to_string())?;
         }
 
         drop(playback);
         // OpenXR handles go before the Vulkan objects they use.
-        drop((swapchain, space, actions, session, frame_wait, frame_stream));
+        drop((aim_spaces, head, panel_swapchain, swapchain, space, actions, session, frame_wait, frame_stream));
         let _ = device.device_wait_idle();
+        device.destroy_buffer(panel_buffer, None);
+        device.free_memory(panel_memory, None);
         for (buffer, memory) in stages {
             device.destroy_buffer(buffer, None);
             device.free_memory(memory, None);
@@ -862,6 +1191,78 @@ fn run(args: Args) -> Result<(), String> {
         vk_instance.destroy_instance(None);
     }
     Ok(())
+}
+
+/// Record: panel pixels -> panel swapchain image, left as a color attachment
+/// as OpenXR expects when the image is released.
+unsafe fn upload_panel(device: &ash::Device, cmd: vk::CommandBuffer, src: vk::Buffer, image: vk::Image) {
+    let range = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    let barrier = |old, new, src_access, dst_access| {
+        vk::ImageMemoryBarrier::default()
+            .old_layout(old)
+            .new_layout(new)
+            .src_access_mask(src_access)
+            .dst_access_mask(dst_access)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(range)
+    };
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier(
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_WRITE,
+            )],
+        );
+        device.cmd_copy_buffer_to_image(
+            cmd,
+            src,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[vk::BufferImageCopy {
+                buffer_offset: 0,
+                buffer_row_length: 0,
+                buffer_image_height: 0,
+                image_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                image_offset: vk::Offset3D::default(),
+                image_extent: vk::Extent3D { width: ui::W as u32, height: ui::H as u32, depth: 1 },
+            }],
+        );
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier(
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::COLOR_ATTACHMENT_READ,
+            )],
+        );
+    }
 }
 
 /// Record: staging buffer -> video texture, ending in SHADER_READ_ONLY_OPTIMAL.
