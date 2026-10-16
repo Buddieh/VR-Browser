@@ -821,7 +821,7 @@ fn run(args: Args) -> Result<(), String> {
         let mut have_frame = false;
         let mut texture_layout = vk::ImageLayout::UNDEFINED;
         let mut frames_uploaded: u64 = 0;
-        let started = Instant::now();
+        let mut started = Instant::now();
         // Turn applied to the video so "Recenter" puts its front where you look.
         let mut recenter = xr::Quaternionf { x: 0.0, y: 0.0, z: 0.0, w: 1.0 };
         let mut panel_shown = true;
@@ -1018,10 +1018,9 @@ fn run(args: Args) -> Result<(), String> {
                 have_frame = true;
                 frames_uploaded += 1;
                 if frames_uploaded % 300 == 0 {
-                    eprintln!(
-                        "video: {frames_uploaded} frames, {:.1} fps",
-                        frames_uploaded as f64 / started.elapsed().as_secs_f64()
-                    );
+                    // Rate over the last 300 frames, so pauses and seeks don't skew it.
+                    eprintln!("video: {frames_uploaded} frames, {:.1} fps", 300.0 / started.elapsed().as_secs_f64());
+                    started = Instant::now();
                 }
             }
 

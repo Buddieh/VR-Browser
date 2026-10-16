@@ -281,6 +281,12 @@ impl Decoder {
                     }
                     break;
                 }
+                if n == 0 {
+                    // Pace from the first frame, not from when ffmpeg started:
+                    // after a seek the stream can take a second to open.
+                    eprintln!("video: first frame decoded after {:.2}s", t0.elapsed().as_secs_f64());
+                    t0 = Instant::now();
+                }
                 let due = t0 + frame_time * n;
                 let now = Instant::now();
                 if due > now {
@@ -289,9 +295,6 @@ impl Decoder {
                     eprintln!("video: decoder running {:.0} ms behind", (now - due).as_secs_f64() * 1e3);
                 }
                 slots.publish(i);
-                if n == 0 {
-                    eprintln!("video: first frame decoded after {:.2}s", t0.elapsed().as_secs_f64());
-                }
                 n += 1;
                 s.frames.store(n as u64, Ordering::Relaxed);
                 // While paused, hold the next frame back and shift the clock.
