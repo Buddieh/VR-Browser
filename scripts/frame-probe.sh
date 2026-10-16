@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Read-only probe of a Steam Frame: what the VR browser can build on.
-# Changes nothing, needs no sudo. Run in Konsole (Desktop mode) or over SSH:
+# Changes no settings and needs no sudo; only writes ~/frame-probe.txt and
+# test clips in ~/frame-probe-videos. Run in Konsole (Desktop mode) or over SSH:
 #   bash frame-probe.sh [path/to/test-video.mp4]
+# Without a file it downloads two ~10 MB test clips to ~/frame-probe-videos.
 # Output goes to the screen and to ~/frame-probe.txt.
 
 out="$HOME/frame-probe.txt"
@@ -58,12 +60,44 @@ have flatpak && flatpak list --app --columns=application 2>/dev/null | grep -Ei 
 section "Free space"
 df -h / /home | sed 1d
 
-if [ -n "$1" ] && [ -f "$1" ] && have gst-launch-1.0; then
-  section "Hardware decode test on $1 (10 s)"
-  timeout 10 gst-launch-1.0 -q filesrc location="$1" ! parsebin ! decodebin3 ! fakesink sync=false 2>&1 | tail -5
-  echo "--- which decoder was picked:"
-  GST_DEBUG=decodebin3:4 timeout 10 gst-launch-1.0 filesrc location="$1" ! parsebin ! decodebin3 ! fakesink sync=false 2>&1 \
-    | grep -oE '(v4l2[a-z0-9]*dec|avdec_[a-z0-9]+|dav1ddec|vp9dec|openh264dec)' | sort -u
+# --- Decode test -----------------------------------------------------------
+# Uses the file given as $1, or downloads two 10-second 1080p test clips
+# (H.264 and H.265, ~10 MB each) from test-videos.co.uk.
+clips=()
+if [ -n "$1" ] && [ -f "$1" ]; then
+  clips=("$1")
+elif have curl; then
+  vdir="$HOME/frame-probe-videos"
+  mkdir -p "$vdir"
+  base="https://test-videos.co.uk/vids/jellyfish/mp4"
+  for codec in h264 h265; do
+    f="$vdir/jellyfish-1080-$codec.mp4"
+    [ -s "$f" ] || curl -fsSL -o "$f" "$base/$codec/1080/Jellyfish_1080_10s_10MB.mp4" || { echo "download of $codec clip failed"; rm -f "$f"; }
+    [ -s "$f" ] && clips+=("$f")
+  done
+fi
+
+decode() { # $1=file $2=pipeline tail after demux; prints seconds or FAIL
+  local t0 t1
+  t0=$(date +%s.%N)
+  if timeout 60 gst-launch-1.0 -q filesrc location="$1" ! qtdemux ! $2 ! fakesink sync=false >/dev/null 2>&1; then
+    t1=$(date +%s.%N); awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2fs\n", b-a}'
+  else
+    echo "FAIL"
+  fi
+}
+
+if have gst-launch-1.0 && [ ${#clips[@]} -gt 0 ]; then
+  section "Decode test (10-second clips; lower time = faster)"
+  for f in "${clips[@]}"; do
+    echo "--- $f"
+    case "$f" in *h265*|*hevc*) codecs="h265";; *h264*) codecs="h264";; *) codecs="h264 h265";; esac
+    for c in $codecs; do
+      gst-inspect-1.0 "v4l2${c}dec" >/dev/null 2>&1 && echo "hardware v4l2${c}dec: $(decode "$f" "${c}parse ! v4l2${c}dec")"
+      gst-inspect-1.0 "avdec_${c}" >/dev/null 2>&1 && echo "software avdec_${c}: $(decode "$f" "${c}parse ! avdec_${c}")"
+    done
+    echo "auto (decodebin3): $(timeout 60 gst-launch-1.0 -q filesrc location="$f" ! parsebin ! decodebin3 ! fakesink sync=false >/dev/null 2>&1 && echo ok || echo FAIL)"
+  done
 fi
 
 printf '\nSaved to %s\n' "$out"
