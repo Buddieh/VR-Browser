@@ -21,7 +21,19 @@ Then play a sample (still in Konsole, while wearing the headset):
 ~/.local/bin/vr-player ~/Videos/vr-samples/360-stereo-tb.mp4 --mode 360 --stereo tb
 ```
 
-Controls: **A** switches 360 / 180 / flat, **B** quits. Every run writes
+Play any video page (YouTube and other sites yt-dlp supports):
+
+```sh
+~/.local/bin/vr-player 'https://www.youtube.com/watch?v=VIDEO_ID'
+```
+
+**Play in VR from Chromium:** open `file:///home/steamos/Downloads/play-in-vr.html`
+in Chromium and drag the button onto the bookmarks bar. On a video page, click
+it; the first time, allow Chromium to open the VR player.
+
+Controls: **A** switches 360 / 180 / flat, **X** switches mono / side-by-side /
+top-bottom 3D, **B** quits. The layout is detected from the video's metadata
+or title, otherwise it starts on a flat screen. Every run writes
 `~/vr-player.log`; paste it into the project thread if something looks wrong.
 
 Options: `--mode 360|180|flat`, `--stereo mono|sbs|tb`, `--sw` (software
