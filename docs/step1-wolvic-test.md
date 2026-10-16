@@ -40,7 +40,8 @@ Pick one:
   adb connect <headset-ip>     # "frame" hostname no longer resolves on 0.5.6 beta
   adb install Wolvic-steam-arm64-gecko-generic-debug.apk
   ```
-
+- On the headset: open Konsole in Desktop mode and run
+- lepton install_app dev ~/Downloads/Wolvic-steam-arm64-gecko-generic-debug.apk. That command comes from a community report (HelloSteamFrame #107), not from Valve, so it may need adjusting.
 ## Tests
 
 Mark each one pass / fail / partly, with a one-line note.
