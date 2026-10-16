@@ -7,11 +7,14 @@ is out of scope for now.
 
 ## Plan
 
-1. **Test Wolvic on the Frame.** If an existing VR browser is good enough, we
-   don't build one. See [docs/step1-wolvic-test.md](docs/step1-wolvic-test.md).
-2. **If not, build a native app:** a small browser panel (WPE WebKit) for
-   finding videos, with playback handed to a native OpenXR video renderer
-   (Rust, Vulkan, hardware decode) for 180/360/SBS.
+1. ~~**Test Wolvic on the Frame.**~~ Done 2026-10-16: the Frame build does not
+   launch, and Android apps get no hardware video decode. See
+   [docs/step1-wolvic-test.md](docs/step1-wolvic-test.md).
+2. **Build a native app:** a WPE WebKit browser panel inside a native OpenXR
+   app. WPE plays `<video>` through GStreamer, which can use the Frame's
+   `qcom-iris` V4L2 hardware decoder; 180/360/SBS video is rendered natively.
+   First check: run [scripts/frame-probe.sh](scripts/frame-probe.sh) on the
+   headset to confirm what's available.
 3. **Installs and updates:** GitHub Actions builds an ARM64 release; install
    with one command; the app checks GitHub Releases for updates.
 4. **Playback hardening:** codec checks (H.264/HEVC/AV1), quick layout
