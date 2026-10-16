@@ -165,18 +165,45 @@ impl Playback {
         start_secs: f64,
         slots: Arc<FrameSlots>,
     ) -> Result<Self, String> {
-        let decoder = if want_hw { hw_decoder(&info.codec) } else { None };
-        let mut cmd = Command::new(tool("ffmpeg"));
-        cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"])
-            .args(["-stream_loop", "-1"]);
-        if start_secs > 0.0 {
-            cmd.args(["-ss", &format!("{start_secs:.3}")]);
-        }
+        let filter = format!("scale={}:{}:flags=bilinear,format={pix_fmt}", out.0, out.1);
+        let decode_args = |decoder: Option<&str>| {
+            let mut a: Vec<String> = vec!["-hide_banner".into(), "-nostdin".into()];
+            if start_secs > 0.0 {
+                a.extend(["-ss".into(), format!("{start_secs:.3}")]);
+            }
+            if let Some(d) = decoder {
+                a.extend(["-c:v".into(), d.into()]);
+            }
+            a.extend(["-i".into(), input.into(), "-an".into(), "-sn".into(), "-vf".into(), filter.clone()]);
+            a
+        };
+
+        // The hardware decoder refuses some streams; check it can produce one
+        // frame before committing to it, and fall back to software if not.
+        let mut decoder = if want_hw { hw_decoder(&info.codec) } else { None };
         if let Some(d) = decoder {
-            cmd.args(["-c:v", d]);
+            let check = Command::new(tool("ffmpeg"))
+                .args(["-loglevel", "warning"])
+                .args(decode_args(Some(d)))
+                .args(["-frames:v", "1", "-f", "null", "-"])
+                .stdin(Stdio::null())
+                .output();
+            match check {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => {
+                    eprintln!("video: hardware decoder {d} failed, using software. ffmpeg said:");
+                    for line in String::from_utf8_lossy(&o.stderr).lines().take(20) {
+                        eprintln!("    {line}");
+                    }
+                    decoder = None;
+                }
+                Err(e) => return Err(format!("could not run ffmpeg: {e}")),
+            }
         }
-        cmd.args(["-i", input, "-an", "-sn"])
-            .args(["-vf", &format!("scale={}:{}:flags=bilinear,format={pix_fmt}", out.0, out.1)])
+
+        let mut cmd = Command::new(tool("ffmpeg"));
+        cmd.args(["-loglevel", "error"])
+            .args(decode_args(decoder))
             .args(["-filter_threads", "4", "-f", "rawvideo", "pipe:1"])
             .stdout(Stdio::piped())
             .stdin(Stdio::null());
@@ -186,7 +213,7 @@ impl Playback {
 
         let audio = {
             let mut a = Command::new(tool("ffplay"));
-            a.args(["-nodisp", "-loglevel", "error", "-loop", "0"]);
+            a.args(["-nodisp", "-autoexit", "-loglevel", "error"]);
             if start_secs > 0.0 {
                 a.args(["-ss", &format!("{start_secs:.3}")]);
             }

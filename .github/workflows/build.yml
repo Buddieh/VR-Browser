@@ -21,7 +21,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake build-essential pkg-config \
             libvulkan-dev libgl1-mesa-dev libx11-dev libx11-xcb-dev libxcb1-dev libxcb-glx0-dev \
-            libxrandr-dev libxxf86vm-dev libwayland-dev
+            libxrandr-dev libxxf86vm-dev libwayland-dev glslang-tools
 
       - uses: dtolnay/rust-toolchain@stable
 
