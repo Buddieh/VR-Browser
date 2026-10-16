@@ -18,6 +18,12 @@ curl -fsSL https://raw.githubusercontent.com/Buddieh/VR-Browser/claude/project-t
 Then paste the contents of `~/frame-probe.txt` into the project thread
 (`cat ~/frame-probe.txt` shows it).
 
+**Follow-up test** (run after the one above; it reuses its clips):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Buddieh/VR-Browser/claude/project-thread-g1s0zv/scripts/ffmpeg-decode-test.sh -o ~/ffmpeg-decode-test.sh && bash ~/ffmpeg-decode-test.sh
+```
+
 Test clips it uses, if you want them directly:
 [H.264 1080p](https://test-videos.co.uk/vids/jellyfish/mp4/h264/1080/Jellyfish_1080_10s_10MB.mp4) ·
 [H.265 1080p](https://test-videos.co.uk/vids/jellyfish/mp4/h265/1080/Jellyfish_1080_10s_10MB.mp4)
