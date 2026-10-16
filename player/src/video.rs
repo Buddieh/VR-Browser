@@ -178,33 +178,42 @@ impl Playback {
             a
         };
 
-        // The hardware decoder refuses some streams; check it can produce one
-        // frame before committing to it, and fall back to software if not.
-        let mut decoder = if want_hw { hw_decoder(&info.codec) } else { None };
-        if let Some(d) = decoder {
+        // Try the hardware decoder first, then software. Each candidate is
+        // test-run for one frame with exactly the arguments playback uses, so
+        // a failure here is logged with ffmpeg's own message.
+        let output_args = ["-f", "rawvideo"];
+        let mut candidates: Vec<Option<&str>> = Vec::new();
+        if want_hw && let Some(d) = hw_decoder(&info.codec) {
+            candidates.push(Some(d));
+        }
+        candidates.push(None);
+        let mut chosen = None;
+        for decoder in candidates {
             let check = Command::new(tool("ffmpeg"))
                 .args(["-loglevel", "warning"])
-                .args(decode_args(Some(d)))
-                .args(["-frames:v", "1", "-f", "null", "-"])
+                .args(decode_args(decoder))
+                .args(output_args)
+                .args(["-frames:v", "1", "-y", "/dev/null"])
                 .stdin(Stdio::null())
-                .output();
-            match check {
-                Ok(o) if o.status.success() => {}
-                Ok(o) => {
-                    eprintln!("video: hardware decoder {d} failed, using software. ffmpeg said:");
-                    for line in String::from_utf8_lossy(&o.stderr).lines().take(20) {
-                        eprintln!("    {line}");
-                    }
-                    decoder = None;
-                }
-                Err(e) => return Err(format!("could not run ffmpeg: {e}")),
+                .output()
+                .map_err(|e| format!("could not run ffmpeg: {e}"))?;
+            let name = decoder.unwrap_or("software");
+            if check.status.success() {
+                chosen = Some(decoder);
+                break;
+            }
+            eprintln!("video: decoder {name} failed its test. ffmpeg said:");
+            for line in String::from_utf8_lossy(&check.stderr).lines().take(20) {
+                eprintln!("    {line}");
             }
         }
+        let decoder = chosen.ok_or("ffmpeg could not decode this video (see messages above)")?;
 
         let mut cmd = Command::new(tool("ffmpeg"));
-        cmd.args(["-loglevel", "error"])
+        cmd.args(["-loglevel", "warning"])
             .args(decode_args(decoder))
-            .args(["-filter_threads", "4", "-f", "rawvideo", "pipe:1"])
+            .args(output_args)
+            .arg("pipe:1")
             .stdout(Stdio::piped())
             .stdin(Stdio::null());
         eprintln!("video: {:?}", cmd);
@@ -236,7 +245,7 @@ impl Playback {
             while !stop_r.load(Ordering::Relaxed) {
                 let i = slots.free_slot();
                 if let Err(e) = pipe.read_exact(slots.slot_mut(i)) {
-                    eprintln!("video: decoder stream ended ({e})");
+                    eprintln!("video: decoder stream ended after {n} frames ({e})");
                     break;
                 }
                 let due = t0 + frame_time * n;
@@ -247,6 +256,9 @@ impl Playback {
                     eprintln!("video: decoder running {:.0} ms behind", (now - due).as_secs_f64() * 1e3);
                 }
                 slots.publish(i);
+                if n == 0 {
+                    eprintln!("video: first frame decoded after {:.2}s", t0.elapsed().as_secs_f64());
+                }
                 n += 1;
             }
         });
