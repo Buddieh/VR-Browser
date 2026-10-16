@@ -1,6 +1,6 @@
 //! vr-player: plays a video in VR on Steam Frame.
 //!
-//! Decoded frames are uploaded to a texture, and every frame each eye is drawn
+//! Decoded frames are uploaded to two textures (luma and chroma), and every frame each eye is drawn
 //! with one full-screen triangle whose fragment shader turns the pixel's view
 //! ray into a position on the video: an equirectangular sphere (360), a
 //! hemisphere (180), YouTube's cubemap or a flat screen. SteamVR on the Frame
@@ -170,6 +170,7 @@ struct EyeConstants {
     pos: [f32; 4],
     rect: [f32; 4],
     params: [f32; 4],
+    color: [f32; 4],
 }
 
 impl EyeConstants {
@@ -593,50 +594,55 @@ fn run(args: Args) -> Result<(), String> {
         );
         let panel = ui::Panel::new(color_format == vk::Format::B8G8R8A8_SRGB);
 
-        // --- Video texture --------------------------------------------------------
-        let tex_format = vk::Format::R8G8B8A8_SRGB;
-        let texture = device
-            .create_image(
-                &vk::ImageCreateInfo::default()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .format(tex_format)
-                    .extent(vk::Extent3D { width, height, depth: 1 })
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
-                    .initial_layout(vk::ImageLayout::UNDEFINED),
-                None,
-            )
-            .map_err(|e| format!("could not create {width}x{height} video texture: {e}"))?;
-        let req = device.get_image_memory_requirements(texture);
-        let texture_memory = device
-            .allocate_memory(
-                &vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(
-                    find_memory(&mem_props, req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
-                        .ok_or("no device memory for the video texture")?,
-                ),
-                None,
-            )
-            .map_err(vkerr)?;
-        device.bind_image_memory(texture, texture_memory, 0).map_err(vkerr)?;
-        let texture_view = device
-            .create_image_view(
-                &vk::ImageViewCreateInfo::default()
-                    .image(texture)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(tex_format)
-                    .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    }),
-                None,
-            )
-            .map_err(vkerr)?;
+        // --- Video textures: full-size luma (R8) and half-size chroma (R8G8) ---------
+        let mut planes = Vec::new();
+        for (format, w, h) in [(vk::Format::R8_UNORM, width, height), (vk::Format::R8G8_UNORM, width / 2, height / 2)] {
+            let image = device
+                .create_image(
+                    &vk::ImageCreateInfo::default()
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .format(format)
+                        .extent(vk::Extent3D { width: w, height: h, depth: 1 })
+                        .mip_levels(1)
+                        .array_layers(1)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .tiling(vk::ImageTiling::OPTIMAL)
+                        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+                        .initial_layout(vk::ImageLayout::UNDEFINED),
+                    None,
+                )
+                .map_err(|e| format!("could not create {w}x{h} video texture: {e}"))?;
+            let req = device.get_image_memory_requirements(image);
+            let memory = device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(
+                        find_memory(&mem_props, req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                            .ok_or("no device memory for the video texture")?,
+                    ),
+                    None,
+                )
+                .map_err(vkerr)?;
+            device.bind_image_memory(image, memory, 0).map_err(vkerr)?;
+            let view = device
+                .create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(format)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        }),
+                    None,
+                )
+                .map_err(vkerr)?;
+            planes.push(Plane { image, memory, view, width: w, height: h });
+        }
+        // Chroma starts right after the luma bytes in each decoded frame.
+        let chroma_offset = width as u64 * height as u64;
         let sampler = device
             .create_sampler(
                 &vk::SamplerCreateInfo::default()
@@ -652,11 +658,13 @@ fn run(args: Args) -> Result<(), String> {
         // --- Pipeline ---------------------------------------------------------------
         let set_layout = device
             .create_descriptor_set_layout(
-                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&[vk::DescriptorSetLayoutBinding::default()
-                    .binding(0)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::FRAGMENT)]),
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&[0, 1].map(|binding| {
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(binding)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                })),
                 None,
             )
             .map_err(vkerr)?;
@@ -676,7 +684,7 @@ fn run(args: Args) -> Result<(), String> {
             .create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&[vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                    descriptor_count: 1,
+                    descriptor_count: 2,
                 }]),
                 None,
             )
@@ -686,18 +694,26 @@ fn run(args: Args) -> Result<(), String> {
                 &vk::DescriptorSetAllocateInfo::default().descriptor_pool(descriptor_pool).set_layouts(&[set_layout]),
             )
             .map_err(vkerr)?[0];
-        device.update_descriptor_sets(
-            &[vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(&[vk::DescriptorImageInfo {
-                    sampler,
-                    image_view: texture_view,
-                    image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                }])],
-            &[],
-        );
+        let image_infos = planes.iter().map(|p| {
+            [vk::DescriptorImageInfo {
+                sampler,
+                image_view: p.view,
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            }]
+        });
+        let image_infos: Vec<_> = image_infos.collect();
+        let writes: Vec<_> = image_infos
+            .iter()
+            .enumerate()
+            .map(|(binding, info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(binding as u32)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(info)
+            })
+            .collect();
+        device.update_descriptor_sets(&writes, &[]);
 
         let shader = |bytes: &[u8]| {
             let code = ash::util::read_spv(&mut Cursor::new(bytes)).map_err(|e| e.to_string())?;
@@ -760,10 +776,12 @@ fn run(args: Args) -> Result<(), String> {
         device.destroy_shader_module(frag, None);
 
         // --- Staging buffers the decoder writes into ----------------------------------
-        let frame_bytes = width as usize * height as usize * 4;
+        // NV12: luma plus quarter-size chroma with two bytes per sample.
+        let frame_bytes = width as usize * height as usize * 3 / 2;
         let mut stages = Vec::new();
         let mut ptrs = Vec::new();
-        for _ in 0..3 {
+        // A few frames of slack so a slow moment in decoding doesn't show.
+        for _ in 0..6 {
             let buffer = device
                 .create_buffer(
                     &vk::BufferCreateInfo::default()
@@ -807,7 +825,7 @@ fn run(args: Args) -> Result<(), String> {
             .map_err(vkerr)?[0];
         let fence = device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(vkerr)?;
 
-        let decoder = video::Decoder::new(&src.video, audio.as_deref(), &info, (width, height), "rgba", args.hw)?;
+        let decoder = video::Decoder::new(&src.video, audio.as_deref(), &info, (width, height), args.hw)?;
         eprintln!("video: decoding with {}", if decoder.is_hw() { "hardware (iris)" } else { "software" });
         let mut playback = decoder.start(args.start, slots.clone(), false)?;
         let duration = info.duration;
@@ -1013,7 +1031,7 @@ fn run(args: Args) -> Result<(), String> {
                         None => {}
                     }
                 }
-                upload_frame(&device, cmd, stages[slot].0, texture, texture_layout, width, height);
+                upload_frame(&device, cmd, stages[slot].0, &planes, chroma_offset, texture_layout);
                 texture_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
                 have_frame = true;
                 frames_uploaded += 1;
@@ -1072,6 +1090,7 @@ fn run(args: Args) -> Result<(), String> {
                     pos: [pos.x, pos.y, pos.z, 0.0],
                     rect: eye_rect(stereo, eye),
                     params: [mode, args.screen_m, args.screen_m / video_aspect, args.screen_m],
+                    color: [info.bt601 as u32 as f32, info.full_range as u32 as f32, 0.0, 0.0],
                 };
                 device.cmd_begin_render_pass(
                     cmd,
@@ -1180,9 +1199,11 @@ fn run(args: Args) -> Result<(), String> {
         device.destroy_descriptor_pool(descriptor_pool, None);
         device.destroy_descriptor_set_layout(set_layout, None);
         device.destroy_sampler(sampler, None);
-        device.destroy_image_view(texture_view, None);
-        device.destroy_image(texture, None);
-        device.free_memory(texture_memory, None);
+        for p in planes {
+            device.destroy_image_view(p.view, None);
+            device.destroy_image(p.image, None);
+            device.free_memory(p.memory, None);
+        }
         device.destroy_render_pass(render_pass, None);
         device.destroy_fence(fence, None);
         device.destroy_command_pool(pool, None);
@@ -1264,15 +1285,24 @@ unsafe fn upload_panel(device: &ash::Device, cmd: vk::CommandBuffer, src: vk::Bu
     }
 }
 
-/// Record: staging buffer -> video texture, ending in SHADER_READ_ONLY_OPTIMAL.
+/// One plane of the video texture pair.
+struct Plane {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    width: u32,
+    height: u32,
+}
+
+/// Record: staging buffer (NV12) -> luma and chroma textures, ending in
+/// SHADER_READ_ONLY_OPTIMAL.
 unsafe fn upload_frame(
     device: &ash::Device,
     cmd: vk::CommandBuffer,
     src: vk::Buffer,
-    image: vk::Image,
+    planes: &[Plane],
+    chroma_offset: u64,
     old_layout: vk::ImageLayout,
-    width: u32,
-    height: u32,
 ) {
     let range = vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -1281,16 +1311,21 @@ unsafe fn upload_frame(
         base_array_layer: 0,
         layer_count: 1,
     };
-    let barrier = |old, new, src_access, dst_access| {
-        vk::ImageMemoryBarrier::default()
-            .old_layout(old)
-            .new_layout(new)
-            .src_access_mask(src_access)
-            .dst_access_mask(dst_access)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(image)
-            .subresource_range(range)
+    let barriers = |old, new, src_access, dst_access| -> Vec<vk::ImageMemoryBarrier> {
+        planes
+            .iter()
+            .map(|p| {
+                vk::ImageMemoryBarrier::default()
+                    .old_layout(old)
+                    .new_layout(new)
+                    .src_access_mask(src_access)
+                    .dst_access_mask(dst_access)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(p.image)
+                    .subresource_range(range)
+            })
+            .collect()
     };
     unsafe {
         device.cmd_pipeline_barrier(
@@ -1300,32 +1335,34 @@ unsafe fn upload_frame(
             vk::DependencyFlags::empty(),
             &[],
             &[],
-            &[barrier(
+            &barriers(
                 old_layout,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::AccessFlags::SHADER_READ,
                 vk::AccessFlags::TRANSFER_WRITE,
-            )],
+            ),
         );
-        device.cmd_copy_buffer_to_image(
-            cmd,
-            src,
-            image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &[vk::BufferImageCopy {
-                buffer_offset: 0,
-                buffer_row_length: 0,
-                buffer_image_height: 0,
-                image_subresource: vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-                image_offset: vk::Offset3D::default(),
-                image_extent: vk::Extent3D { width, height, depth: 1 },
-            }],
-        );
+        for (p, offset) in planes.iter().zip([0, chroma_offset]) {
+            device.cmd_copy_buffer_to_image(
+                cmd,
+                src,
+                p.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[vk::BufferImageCopy {
+                    buffer_offset: offset,
+                    buffer_row_length: 0,
+                    buffer_image_height: 0,
+                    image_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    image_offset: vk::Offset3D::default(),
+                    image_extent: vk::Extent3D { width: p.width, height: p.height, depth: 1 },
+                }],
+            );
+        }
         device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::TRANSFER,
@@ -1333,12 +1370,12 @@ unsafe fn upload_frame(
             vk::DependencyFlags::empty(),
             &[],
             &[],
-            &[barrier(
+            &barriers(
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                 vk::AccessFlags::TRANSFER_WRITE,
                 vk::AccessFlags::SHADER_READ,
-            )],
+            ),
         );
     }
 }

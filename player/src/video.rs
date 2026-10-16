@@ -1,7 +1,9 @@
 //! Video decoding through the system `ffmpeg` binary.
 //!
 //! ffmpeg decodes (with the Frame's iris hardware decoder via V4L2 mem2mem when
-//! the codec allows), converts to RGBA and writes raw frames to a pipe. A
+//! the codec allows) and writes raw NV12 frames (the decoder's own layout:
+//! full-size luma, then half-size interleaved chroma) to a pipe; the shader
+//! turns them into colour. A
 //! reader thread paces those frames and writes each
 //! one straight into a GPU-visible staging buffer picked by `FrameSlots`.
 //! Audio is played by a separate `ffplay` process, and frames are held until
@@ -26,6 +28,9 @@ pub struct VideoInfo {
     pub height: u32,
     pub fps: f64,
     pub has_audio: bool,
+    /// Colour matrix and range for turning YUV into RGB.
+    pub bt601: bool,
+    pub full_range: bool,
     /// Length in seconds, when the container says.
     pub duration: Option<f64>,
 }
@@ -38,7 +43,7 @@ fn tool(name: &str) -> String {
 pub fn probe(input: &str) -> Result<VideoInfo, String> {
     let out = Command::new(tool("ffprobe"))
         .args(["-v", "error", "-select_streams", "v:0"])
-        .args(["-show_entries", "stream=codec_name,width,height,avg_frame_rate,r_frame_rate:format=duration"])
+        .args(["-show_entries", "stream=codec_name,width,height,avg_frame_rate,r_frame_rate,color_space,color_range:format=duration"])
         .args(["-of", "default=nw=1", input])
         .output()
         .map_err(|e| format!("could not run ffprobe: {e}"))?;
@@ -52,10 +57,17 @@ pub fn probe(input: &str) -> Result<VideoInfo, String> {
         let (n, d): (f64, f64) = (n.parse().ok()?, d.parse().ok()?);
         (d > 0.0 && n > 0.0).then(|| n / d)
     };
+    let height: u32 = kv.get("height").and_then(|v| v.parse().ok()).ok_or("no video height")?;
     Ok(VideoInfo {
+        bt601: match kv.get("color_space").copied() {
+            Some("bt470bg" | "smpte170m") => true,
+            Some("bt709") => false,
+            _ => height < 720,
+        },
+        full_range: kv.get("color_range") == Some(&"pc"),
         codec: kv.get("codec_name").unwrap_or(&"unknown").to_string(),
         width: kv.get("width").and_then(|v| v.parse().ok()).ok_or("no video width")?,
-        height: kv.get("height").and_then(|v| v.parse().ok()).ok_or("no video height")?,
+        height,
         fps: rate("avg_frame_rate").or_else(|| rate("r_frame_rate")).unwrap_or(30.0),
         duration: kv.get("duration").and_then(|v| v.parse().ok()).filter(|d: &f64| *d > 0.0),
         has_audio: Command::new(tool("ffprobe"))
@@ -165,42 +177,48 @@ impl FrameSlots {
 
 /// How to decode one input; worked out once, then used for every seek.
 pub struct Decoder {
-    input: String,
     audio_input: Option<String>,
-    filter: String,
+    /// Input as given to ffmpeg (web streams go through a read-ahead buffer).
+    video_url: String,
+    filter: Option<String>,
     fps: f64,
     /// `Some(name)` = hardware decoder, `None` = ffmpeg's software decoder.
     decoder: Option<&'static str>,
 }
 
 impl Decoder {
-    /// Pick the decoder for `input`. `pix_fmt` is ffmpeg's name for the
-    /// texture's byte order ("rgba" or "bgra").
+    /// Pick the decoder for `input`, producing NV12 frames of size `out`.
     pub fn new(
         input: &str,
         audio_input: Option<&str>,
         info: &VideoInfo,
         out: (u32, u32),
-        pix_fmt: &str,
         want_hw: bool,
     ) -> Result<Self, String> {
+        let scale = (out.0, out.1) != (info.width, info.height);
         let mut d = Self {
-            input: input.to_string(),
+            video_url: input.to_string(),
             audio_input: audio_input.map(str::to_string),
-            filter: format!("scale={}:{}:flags=bilinear,format={pix_fmt}", out.0, out.1),
+            filter: scale.then(|| format!("scale={}:{}:flags=bilinear", out.0, out.1)),
             fps: info.fps,
             decoder: None,
         };
-        // Try the hardware decoder first, then software. Each candidate is
-        // test-run for one frame with exactly the arguments playback uses, so
-        // a failure here is logged with ffmpeg's own message.
-        let mut candidates: Vec<Option<&'static str>> = Vec::new();
-        if want_hw && let Some(hw) = hw_decoder(&info.codec) {
-            candidates.push(Some(hw));
+        // Try the hardware decoder first, then software; for web streams,
+        // first with ffmpeg's read-ahead buffer ("async:") so network hiccups
+        // don't stall the picture. Each candidate is test-run for one frame
+        // with exactly the arguments playback uses, so a failure here is
+        // logged with ffmpeg's own message.
+        let web = input.starts_with("http://") || input.starts_with("https://");
+        let mut candidates: Vec<(Option<&'static str>, bool)> = Vec::new();
+        for read_ahead in if web { &[true, false][..] } else { &[false][..] } {
+            if want_hw && let Some(hw) = hw_decoder(&info.codec) {
+                candidates.push((Some(hw), *read_ahead));
+            }
+            candidates.push((None, *read_ahead));
         }
-        candidates.push(None);
-        for candidate in candidates {
+        for (candidate, read_ahead) in candidates {
             d.decoder = candidate;
+            d.video_url = if read_ahead { format!("async:{input}") } else { input.to_string() };
             let check = Command::new(tool("ffmpeg"))
                 .args(["-loglevel", "warning"])
                 .args(d.decode_args(0.0))
@@ -211,7 +229,11 @@ impl Decoder {
             if check.status.success() {
                 return Ok(d);
             }
-            eprintln!("video: decoder {} failed its test. ffmpeg said:", candidate.unwrap_or("software"));
+            eprintln!(
+                "video: decoder {}{} failed its test. ffmpeg said:",
+                candidate.unwrap_or("software"),
+                if read_ahead { " with read-ahead" } else { "" }
+            );
             for line in String::from_utf8_lossy(&check.stderr).lines().take(20) {
                 eprintln!("    {line}");
             }
@@ -231,8 +253,11 @@ impl Decoder {
         if let Some(d) = self.decoder {
             a.extend(["-c:v".into(), d.into()]);
         }
-        a.extend(["-i".into(), self.input.clone(), "-an".into(), "-sn".into(), "-vf".into(), self.filter.clone()]);
-        a.extend(["-f".into(), "rawvideo".into()]);
+        a.extend(["-i".into(), self.video_url.clone(), "-an".into(), "-sn".into()]);
+        if let Some(f) = &self.filter {
+            a.extend(["-vf".into(), f.clone()]);
+        }
+        a.extend(["-pix_fmt".into(), "nv12".into(), "-f".into(), "rawvideo".into()]);
         a
     }
 
@@ -282,9 +307,21 @@ impl Decoder {
             // Frame clock (instant, video time) for when there is no sound to follow.
             let mut anchor: Option<(Instant, f64)> = None;
             let mut n: u32 = 0;
+            // Time spent waiting for ffmpeg, to tell decoding limits from pacing.
+            let mut reading = Duration::ZERO;
             while !s.stop.load(Ordering::Relaxed) {
                 let i = slots.free_slot();
-                if let Err(e) = pipe.read_exact(slots.slot_mut(i)) {
+                let read_start = Instant::now();
+                let read = pipe.read_exact(slots.slot_mut(i));
+                reading += read_start.elapsed();
+                if n > 0 && n % 300 == 0 {
+                    eprintln!(
+                        "video: decoder delivers up to {:.1} fps (needs {fps:.1})",
+                        300.0 / reading.as_secs_f64().max(1e-3)
+                    );
+                    reading = Duration::ZERO;
+                }
+                if let Err(e) = read {
                     if !s.stop.load(Ordering::Relaxed) {
                         eprintln!("video: decoder stream ended after {n} frames ({e})");
                         s.ended.store(true, Ordering::Relaxed);
@@ -471,20 +508,19 @@ impl Drop for Playback {
 /// (EAC: six cube faces in a 3x2 grid) rather than equirectangular. In EAC
 /// the two rows of faces meet at the middle of the picture with a hard
 /// edge, while an equirectangular picture is continuous at its horizon.
-/// `None` when the frame has too little detail to tell (black, fades).
-pub fn looks_like_eac(px: &[u8], w: usize, h: usize) -> Option<bool> {
-    if w < 64 || h < 64 || px.len() < w * h * 4 {
+/// Works on the luma plane (`w` x `h` bytes). `None` when the frame has too
+/// little detail to tell (black, fades).
+pub fn looks_like_eac(luma: &[u8], w: usize, h: usize) -> Option<bool> {
+    if w < 64 || h < 64 || luma.len() < w * h {
         return None;
     }
-    let pixel = |x: usize, y: usize| &px[(y * w + x) * 4..(y * w + x) * 4 + 3];
-    let diff = |a: &[u8], b: &[u8]| a.iter().zip(b).map(|(p, q)| p.abs_diff(*q) as f64).sum::<f64>() / 3.0;
-    let row_diff = |y0: usize, y1: usize| (0..w).step_by(2).map(|x| diff(pixel(x, y0), pixel(x, y1))).sum::<f64>() / (w / 2) as f64;
+    let px = |x: usize, y: usize| luma[y * w + x];
+    let row_diff = |y0: usize, y1: usize| {
+        (0..w).step_by(2).map(|x| px(x, y0).abs_diff(px(x, y1)) as f64).sum::<f64>() / w.div_ceil(2) as f64
+    };
 
-    // Detail: average difference between neighbouring samples across the frame.
-    let detail = (1..16)
-        .map(|k| row_diff(h * k / 16, h * k / 16 + 2))
-        .sum::<f64>()
-        / 15.0;
+    // Detail: average difference between nearby rows across the frame.
+    let detail = (1..16).map(|k| row_diff(h * k / 16, h * k / 16 + 2)).sum::<f64>() / 15.0;
     if detail < 1.0 {
         return None;
     }
@@ -496,7 +532,7 @@ pub fn looks_like_eac(px: &[u8], w: usize, h: usize) -> Option<bool> {
         .flat_map(|j| (0..32).map(move |i| (i, j)))
         .map(|(i, j)| {
             let (x, y) = (w * (2 * i + 1) / 64, mid * (2 * j + 1) / 64);
-            diff(pixel(x, y), pixel(x, y + mid))
+            px(x, y).abs_diff(px(x, y + mid)) as f64
         })
         .sum::<f64>()
         / 1024.0;
