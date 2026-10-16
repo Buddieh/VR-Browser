@@ -28,13 +28,16 @@ resolution 180/360 video to be the weak spot.
 Pick one:
 
 - **On the headset (SteamOS 0.5.6 beta or newer):** switch to the beta in
-  Settings > System > System Update Channel, download the APK in Desktop mode,
-  right-click it and install. It appears in your Steam library.
+  Settings > System > System Update Channel, then install the update and
+  restart (check the version reads 0.5.6+). Download the APK in Desktop mode,
+  right-click it and choose "Add to Steam" (not double-click). It appears in
+  your Steam library. Community fallback in Konsole:
+  `lepton install_app dev ~/Downloads/<file>.apk`.
 - **From a PC with adb:** enable Developer Mode, launch "Lepton Development"
   from your library, then run:
 
   ```sh
-  adb connect frame            # or the headset's IP
+  adb connect <headset-ip>     # "frame" hostname no longer resolves on 0.5.6 beta
   adb install Wolvic-steam-arm64-gecko-generic-debug.apk
   ```
 
