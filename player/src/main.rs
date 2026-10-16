@@ -264,7 +264,7 @@ fn run(mut args: Args) -> Result<(), String> {
         .into_iter()
         .find(|(f, _)| formats.contains(&(f.as_raw() as u32)))
         .ok_or("runtime offers no 8-bit RGBA swapchain format")?;
-        eprintln!("openxr: swapchain format {format:?}");
+        eprintln!("openxr: swapchain format {} ({pix_fmt})", format.as_raw());
 
         let mut swapchain = session
             .create_swapchain(&xr::SwapchainCreateInfo {
