@@ -23,6 +23,7 @@ pub struct VideoInfo {
     pub width: u32,
     pub height: u32,
     pub fps: f64,
+    pub has_audio: bool,
 }
 
 fn tool(name: &str) -> String {
@@ -52,6 +53,11 @@ pub fn probe(input: &str) -> Result<VideoInfo, String> {
         width: kv.get("width").and_then(|v| v.parse().ok()).ok_or("no video width")?,
         height: kv.get("height").and_then(|v| v.parse().ok()).ok_or("no video height")?,
         fps: rate("avg_frame_rate").or_else(|| rate("r_frame_rate")).unwrap_or(30.0),
+        has_audio: Command::new(tool("ffprobe"))
+            .args(["-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", input])
+            .output()
+            .map(|o| !o.stdout.is_empty())
+            .unwrap_or(false),
     })
 }
 
@@ -220,7 +226,10 @@ impl Playback {
         let mut video = cmd.spawn().map_err(|e| format!("could not run ffmpeg: {e}"))?;
         let mut pipe = video.stdout.take().unwrap();
 
-        let audio = {
+        let audio = if !info.has_audio {
+            eprintln!("audio: this video has no sound track");
+            None
+        } else {
             let mut a = Command::new(tool("ffplay"));
             a.args(["-nodisp", "-autoexit", "-loglevel", "error"]);
             if start_secs > 0.0 {
