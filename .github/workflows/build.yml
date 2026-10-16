@@ -3,7 +3,7 @@ name: build
 on:
   push:
     branches: [claude/project-thread-g1s0zv, main]
-    paths: ["player/**", ".github/workflows/build.yml"]
+    paths: ["player/**", ".github/workflows/build.yml", "scripts/vr-play*", "scripts/play-in-vr.html", "scripts/vr-player-launcher.sh"]
   workflow_dispatch:
 
 permissions:
@@ -33,7 +33,7 @@ jobs:
         run: |
           mkdir -p dist/vr-player
           cp player/target/release/vr-player dist/vr-player/
-          cp scripts/vr-player-launcher.sh dist/vr-player/
+          cp scripts/vr-player-launcher.sh scripts/vr-play-url.sh scripts/play-in-vr.html dist/vr-player/
           echo "${GITHUB_SHA}" > dist/vr-player/VERSION
           tar -C dist -czf vr-player-linux-arm64.tar.gz vr-player
           sha256sum vr-player-linux-arm64.tar.gz > vr-player-linux-arm64.tar.gz.sha256

@@ -1,0 +1,16 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Play in VR bookmark</title>
+<style>
+  body { font: 18px/1.5 system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; background: #111; color: #eee; }
+  a.bm { display: inline-block; padding: .8rem 1.4rem; background: #3b82f6; color: #fff; border-radius: .6rem; text-decoration: none; font-weight: 600; }
+  code { background: #222; padding: .1rem .3rem; border-radius: .3rem; word-break: break-all; }
+</style>
+<h1>Play in VR</h1>
+<p>Drag this button onto Chromium's bookmarks bar (show the bar with <b>Ctrl+Shift+B</b>):</p>
+<p><a class="bm" href="javascript:location.href='vrplay:'+encodeURIComponent(location.href)">▶ Play in VR</a></p>
+<p>Then, on any video page (YouTube and many other sites), click it. The first time,
+Chromium asks whether to open the link with the VR player; tick "always allow" and confirm.</p>
+<p>If dragging doesn't work, add a bookmark by hand and paste this as its URL:</p>
+<p><code>javascript:location.href='vrplay:'+encodeURIComponent(location.href)</code></p>

@@ -6,6 +6,7 @@
 //! hemisphere (180) or a flat screen. SteamVR on the Frame has no equirect
 //! composition layers, so the app does this projection itself.
 
+mod source;
 mod video;
 
 use std::{ffi::CStr, io::Cursor, sync::Arc, time::Duration};
@@ -29,8 +30,9 @@ enum Stereo {
 
 struct Args {
     input: String,
-    projection: Projection,
-    stereo: Stereo,
+    /// `None` = detect from the video's metadata or title.
+    projection: Option<Projection>,
+    stereo: Option<Stereo>,
     hw: bool,
     max_width: u32,
     start: f64,
@@ -40,7 +42,12 @@ struct Args {
 const USAGE: &str = "usage: vr-player <file-or-url> [--mode 360|180|flat] [--stereo mono|sbs|tb] \
 [--sw] [--max-width N] [--start SECONDS] [--screen METERS]
 
-Controls: A = cycle 360 / 180 / flat, B or Y = quit";
+The input can be a video file, a direct video URL, or a web page (YouTube and
+other sites supported by yt-dlp). Without --mode/--stereo the layout is
+detected from the video's metadata or title.
+
+Controls: A = cycle 360 / 180 / flat, X = cycle mono / side-by-side / top-bottom,
+B or Y = quit";
 
 const VIEW_TYPE: xr::ViewConfigurationType = xr::ViewConfigurationType::PRIMARY_STEREO;
 
@@ -48,8 +55,8 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
     let mut a = Args {
         input: String::new(),
-        projection: Projection::Sphere360,
-        stereo: Stereo::Mono,
+        projection: None,
+        stereo: None,
         hw: true,
         max_width: 4096,
         start: 0.0,
@@ -59,20 +66,20 @@ fn parse_args() -> Result<Args, String> {
         let mut val = |name: &str| it.next().ok_or(format!("{name} needs a value"));
         match arg.as_str() {
             "--mode" => {
-                a.projection = match val("--mode")?.as_str() {
+                a.projection = Some(match val("--mode")?.as_str() {
                     "360" => Projection::Sphere360,
                     "180" => Projection::Dome180,
                     "flat" => Projection::Flat,
                     m => return Err(format!("unknown mode {m}")),
-                }
+                })
             }
             "--stereo" => {
-                a.stereo = match val("--stereo")?.as_str() {
+                a.stereo = Some(match val("--stereo")?.as_str() {
                     "mono" => Stereo::Mono,
                     "sbs" => Stereo::SideBySide,
                     "tb" => Stereo::TopBottom,
                     m => return Err(format!("unknown stereo layout {m}")),
-                }
+                })
             }
             "--sw" => a.hw = false,
             "--max-width" => a.max_width = val("--max-width")?.parse().map_err(|_| "bad --max-width")?,
@@ -149,13 +156,21 @@ fn find_memory(props: &vk::PhysicalDeviceMemoryProperties, bits: u32, want: vk::
         .find(|&i| bits & (1 << i) != 0 && props.memory_types[i as usize].property_flags.contains(want))
 }
 
-fn run(mut args: Args) -> Result<(), String> {
-    let info = video::probe(&args.input)?;
+fn run(args: Args) -> Result<(), String> {
+    let src = source::resolve(&args.input, args.max_width)?;
+    let info = video::probe(&src.video)?;
     let (width, height) = video::output_size(&info, args.max_width);
+
+    // Layout: command line, then stream metadata, then the title; else a flat screen.
+    let meta = source::probe_hints(&src.video);
+    let named = source::guess_from_name(&src.title);
+    let mut projection = args.projection.or(meta.projection).or(named.projection).unwrap_or(Projection::Flat);
+    let mut stereo = args.stereo.or(meta.stereo).or(named.stereo).unwrap_or(Stereo::Mono);
     eprintln!(
         "video: {} {}x{} @ {:.2} fps -> {}x{}, {:?} {:?}",
-        info.codec, info.width, info.height, info.fps, width, height, args.projection, args.stereo
+        info.codec, info.width, info.height, info.fps, width, height, projection, stereo
     );
+    let audio = src.audio.clone().or_else(|| info.has_audio.then(|| src.video.clone()));
 
     // --- OpenXR instance -------------------------------------------------
     let entry = xr::Entry::linked(&()).map_err(|e| format!("OpenXR loader: {e}"))?;
@@ -266,26 +281,34 @@ fn run(mut args: Args) -> Result<(), String> {
         let actions = instance.create_action_set("player", "Player", 0).map_err(|e| e.to_string())?;
         let quit = actions.create_action::<bool>("quit", "Quit", &[]).map_err(|e| e.to_string())?;
         let cycle = actions.create_action::<bool>("cycle", "Cycle 360/180/flat", &[]).map_err(|e| e.to_string())?;
+        let cycle_stereo =
+            actions.create_action::<bool>("stereo", "Cycle mono/SBS/TB", &[]).map_err(|e| e.to_string())?;
         let path = |p: &str| instance.string_to_path(p).unwrap();
-        for (profile, quit_paths, cycle_path) in [
+        for (profile, quit_paths, cycle_path, stereo_path) in [
             (
                 "/interaction_profiles/oculus/touch_controller",
                 &["/user/hand/right/input/b/click", "/user/hand/left/input/y/click"][..],
                 "/user/hand/right/input/a/click",
+                Some("/user/hand/left/input/x/click"),
             ),
             (
                 "/interaction_profiles/valve/index_controller",
                 &["/user/hand/right/input/b/click", "/user/hand/left/input/b/click"][..],
                 "/user/hand/right/input/a/click",
+                Some("/user/hand/left/input/a/click"),
             ),
             (
                 "/interaction_profiles/khr/simple_controller",
                 &["/user/hand/right/input/menu/click"][..],
                 "/user/hand/right/input/select/click",
+                Some("/user/hand/left/input/select/click"),
             ),
         ] {
             let mut b: Vec<xr::Binding> = quit_paths.iter().map(|p| xr::Binding::new(&quit, path(p))).collect();
             b.push(xr::Binding::new(&cycle, path(cycle_path)));
+            if let Some(sp) = stereo_path {
+                b.push(xr::Binding::new(&cycle_stereo, path(sp)));
+            }
             if let Err(e) = instance.suggest_interaction_profile_bindings(path(profile), &b) {
                 eprintln!("input: bindings for {profile} rejected: {e}");
             }
@@ -599,7 +622,8 @@ fn run(mut args: Args) -> Result<(), String> {
         let fence = device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(vkerr)?;
 
         let playback = video::Playback::start(
-            &args.input,
+            &src.video,
+            audio.as_deref(),
             &info,
             (width, height),
             "rgba",
@@ -660,12 +684,20 @@ fn run(mut args: Args) -> Result<(), String> {
                 let _ = session.request_exit();
             }
             if pressed(&cycle) {
-                args.projection = match args.projection {
+                projection = match projection {
                     Projection::Sphere360 => Projection::Dome180,
                     Projection::Dome180 => Projection::Flat,
                     Projection::Flat => Projection::Sphere360,
                 };
-                eprintln!("input: projection {:?}", args.projection);
+                eprintln!("input: projection {projection:?}");
+            }
+            if pressed(&cycle_stereo) {
+                stereo = match stereo {
+                    Stereo::Mono => Stereo::SideBySide,
+                    Stereo::SideBySide => Stereo::TopBottom,
+                    Stereo::TopBottom => Stereo::Mono,
+                };
+                eprintln!("input: stereo {stereo:?}");
             }
 
             let new_frame = slots.take_latest(last_seq);
@@ -707,10 +739,10 @@ fn run(mut args: Args) -> Result<(), String> {
             }
 
             let video_aspect = {
-                let r = eye_rect(args.stereo, 0);
+                let r = eye_rect(stereo, 0);
                 (width as f32 * r[2]) / (height as f32 * r[3]).max(1.0)
             };
-            let mode = match args.projection {
+            let mode = match projection {
                 Projection::Sphere360 => 0.0,
                 Projection::Dome180 => 1.0,
                 Projection::Flat => 2.0,
@@ -725,7 +757,7 @@ fn run(mut args: Args) -> Result<(), String> {
                         view.fov.angle_down.tan(),
                     ],
                     pos: [view.pose.position.x, view.pose.position.y, view.pose.position.z, 0.0],
-                    rect: eye_rect(args.stereo, eye),
+                    rect: eye_rect(stereo, eye),
                     params: [mode, args.screen_m, args.screen_m / video_aspect, args.screen_m],
                 };
                 device.cmd_begin_render_pass(

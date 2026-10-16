@@ -20,8 +20,34 @@ curl -fsSL "$url.sha256" -o "$tmp/vr-player.tar.gz.sha256"
 rm -rf "$dest"
 mkdir -p "$dest" "$bin"
 tar -xzf "$tmp/vr-player.tar.gz" -C "$dest" --strip-components=1
-chmod +x "$dest/vr-player" "$dest/vr-player-launcher.sh"
+chmod +x "$dest/vr-player" "$dest/vr-player-launcher.sh" "$dest/vr-play-url.sh"
 ln -sf "$dest/vr-player-launcher.sh" "$bin/vr-player"
+
+echo "Fetching yt-dlp (finds the video on web pages)..."
+curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux_aarch64" -o "$dest/yt-dlp"
+chmod +x "$dest/yt-dlp"
+echo "Fetching Deno (yt-dlp needs a JavaScript runtime for YouTube)..."
+curl -fsSL "https://github.com/denoland/deno/releases/latest/download/deno-aarch64-unknown-linux-gnu.zip" -o "$tmp/deno.zip"
+python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extract("deno", sys.argv[2])' "$tmp/deno.zip" "$dest"
+chmod +x "$dest/deno"
+
+echo "Registering vrplay: links for the Play in VR bookmark..."
+apps="$HOME/.local/share/applications"
+mkdir -p "$apps"
+cat > "$apps/vr-player-url.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=VR Player
+Comment=Play a web page's video in VR
+Exec=$dest/vr-play-url.sh %u
+MimeType=x-scheme-handler/vrplay;
+NoDisplay=true
+Terminal=false
+DESKTOP
+xdg-mime default vr-player-url.desktop x-scheme-handler/vrplay 2>/dev/null || true
+update-desktop-database "$apps" 2>/dev/null || true
+mkdir -p "$HOME/Downloads"
+cp "$dest/play-in-vr.html" "$HOME/Downloads/play-in-vr.html"
 
 echo "Fetching two small sample videos..."
 mkdir -p "$samples"
@@ -34,4 +60,8 @@ echo "Installed build $(cut -c1-7 "$dest/VERSION") to $dest"
 echo "Try it (SteamVR must be running, i.e. you're in the headset):"
 echo "  ~/.local/bin/vr-player ~/Videos/vr-samples/360-mono.mp4 --mode 360"
 echo "  ~/.local/bin/vr-player ~/Videos/vr-samples/360-stereo-tb.mp4 --mode 360 --stereo tb"
-echo "Controls: A = switch 360/180/flat, B = quit. Log: ~/vr-player.log"
+echo "  ~/.local/bin/vr-player 'https://www.youtube.com/watch?v=...'   (any video page)"
+echo "Controls: A = 360/180/flat, X = mono/side-by-side/top-bottom, B = quit. Log: ~/vr-player.log"
+echo
+echo "Play in VR from Chromium: open this file in Chromium and drag the button to the bookmarks bar:"
+echo "  file://$HOME/Downloads/play-in-vr.html"

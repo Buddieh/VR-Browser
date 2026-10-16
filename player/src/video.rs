@@ -164,6 +164,7 @@ impl Playback {
     /// swapchain's byte order ("rgba" or "bgra").
     pub fn start(
         input: &str,
+        audio_input: Option<&str>,
         info: &VideoInfo,
         out: (u32, u32),
         pix_fmt: &str,
@@ -226,16 +227,13 @@ impl Playback {
         let mut video = cmd.spawn().map_err(|e| format!("could not run ffmpeg: {e}"))?;
         let mut pipe = video.stdout.take().unwrap();
 
-        let audio = if !info.has_audio {
-            eprintln!("audio: this video has no sound track");
-            None
-        } else {
+        let audio = if let Some(audio_input) = audio_input {
             let mut a = Command::new(tool("ffplay"));
             a.args(["-nodisp", "-autoexit", "-loglevel", "error"]);
             if start_secs > 0.0 {
                 a.args(["-ss", &format!("{start_secs:.3}")]);
             }
-            a.arg(input).stdin(Stdio::null()).stdout(Stdio::null());
+            a.arg(audio_input).stdin(Stdio::null()).stdout(Stdio::null());
             match a.spawn() {
                 Ok(c) => Some(c),
                 Err(e) => {
@@ -243,6 +241,9 @@ impl Playback {
                     None
                 }
             }
+        } else {
+            eprintln!("audio: this video has no sound track");
+            None
         };
 
         let stop = Arc::new(AtomicBool::new(false));
