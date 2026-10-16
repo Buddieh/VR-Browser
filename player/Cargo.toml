@@ -1,0 +1,14 @@
+[package]
+name = "vr-player"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Lightweight VR video player for Steam Frame (OpenXR, hardware decode via ffmpeg)"
+
+[dependencies]
+openxr = { version = "0.22", default-features = false, features = ["static"] }
+ash = { version = "0.38", default-features = false, features = ["loaded"] }
+
+[profile.release]
+lto = "thin"
+strip = true
