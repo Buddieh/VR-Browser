@@ -5,39 +5,51 @@ personal use. Goal: open a website, find a video, and watch it in VR (flat,
 180, 360, side-by-side 3D) smoothly. WebXR sites should work too. DRM content
 is out of scope for now.
 
-## On the Frame: hardware check (current step)
+## On the Frame: install the VR player (current step)
 
-Open **Konsole** in Desktop mode and paste this one line. It downloads two
-10-second test clips (~10 MB each), checks the video hardware, and saves the
-report to `~/frame-probe.txt`:
+Open **Konsole** in Desktop mode and paste this. It installs (or updates) the
+player and downloads two small 360 sample videos:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Buddieh/VR-Browser/claude/project-thread-g1s0zv/scripts/install.sh | bash
+```
+
+Then play a sample (still in Konsole, while wearing the headset):
+
+```sh
+~/.local/bin/vr-player ~/Videos/vr-samples/360-mono.mp4 --mode 360
+~/.local/bin/vr-player ~/Videos/vr-samples/360-stereo-tb.mp4 --mode 360 --stereo tb
+```
+
+Controls: **A** switches 360 / 180 / flat, **B** quits. Every run writes
+`~/vr-player.log`; paste it into the project thread if something looks wrong.
+
+Options: `--mode 360|180|flat`, `--stereo mono|sbs|tb`, `--sw` (software
+decode, for comparison), `--start SECONDS`, `--max-width N` (default 4096),
+`--screen METERS` (flat screen width).
+
+<details><summary>Earlier hardware checks</summary>
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Buddieh/VR-Browser/claude/project-thread-g1s0zv/scripts/frame-probe.sh -o ~/frame-probe.sh && bash ~/frame-probe.sh
-```
-
-Then paste the contents of `~/frame-probe.txt` into the project thread
-(`cat ~/frame-probe.txt` shows it).
-
-**Follow-up test** (run after the one above; it reuses its clips):
-
-```sh
 curl -fsSL https://raw.githubusercontent.com/Buddieh/VR-Browser/claude/project-thread-g1s0zv/scripts/ffmpeg-decode-test.sh -o ~/ffmpeg-decode-test.sh && bash ~/ffmpeg-decode-test.sh
 ```
 
-Test clips it uses, if you want them directly:
-[H.264 1080p](https://test-videos.co.uk/vids/jellyfish/mp4/h264/1080/Jellyfish_1080_10s_10MB.mp4) ·
-[H.265 1080p](https://test-videos.co.uk/vids/jellyfish/mp4/h265/1080/Jellyfish_1080_10s_10MB.mp4)
+Result (2026-10-16): the iris hardware decoder works through the system
+ffmpeg (H.264, H.265, VP9); the system GStreamer has no usable decoders.
+</details>
 
 ## Plan
 
 1. ~~**Test Wolvic on the Frame.**~~ Done 2026-10-16: the Frame build does not
    launch, and Android apps get no hardware video decode. See
    [docs/step1-wolvic-test.md](docs/step1-wolvic-test.md).
-2. **Build a native app:** a WPE WebKit browser panel inside a native OpenXR
-   app. WPE plays `<video>` through GStreamer, which can use the Frame's
-   `qcom-iris` V4L2 hardware decoder; 180/360/SBS video is rendered natively.
-   First check: run [scripts/frame-probe.sh](scripts/frame-probe.sh) on the
-   headset to confirm what's available.
+2. **VR player first** (decided 2026-10-16): [player/](player/) is a native
+   OpenXR app that shows 360/180/flat, mono/SBS/TB video using OpenXR
+   composition layers, decoded by the system ffmpeg on the Frame's iris
+   hardware decoder. Browsing happens in the Chromium already on the Frame;
+   next comes a "Play in VR" hand-off (with yt-dlp for sites like YouTube).
+   A full in-app browser (WPE WebKit) and WebXR come later.
 3. **Installs and updates:** GitHub Actions builds an ARM64 release; install
    with one command; the app checks GitHub Releases for updates.
 4. **Playback hardening:** codec checks (H.264/HEVC/AV1), quick layout
