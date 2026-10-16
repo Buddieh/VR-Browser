@@ -2,15 +2,16 @@
 //!
 //! ffmpeg decodes (with the Frame's iris hardware decoder via V4L2 mem2mem when
 //! the codec allows), converts to RGBA and writes raw frames to a pipe. A
-//! reader thread paces those frames to the video's frame rate and writes each
+//! reader thread paces those frames and writes each
 //! one straight into a GPU-visible staging buffer picked by `FrameSlots`.
-//! Audio is played by a separate `ffplay` process. Seeking restarts both
-//! processes at the new position; pausing holds frames back and freezes ffplay.
+//! Audio is played by a separate `ffplay` process, and frames are held until
+//! ffplay's clock reaches them, so picture follows sound. Seeking restarts
+//! both processes at the new position; pausing freezes ffplay.
 
 use std::{
     collections::HashMap,
     io::Read,
-    process::{Child, Command, Stdio},
+    process::{Child, ChildStderr, Command, Stdio},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -247,15 +248,22 @@ impl Decoder {
         let mut video = cmd.spawn().map_err(|e| format!("could not run ffmpeg: {e}"))?;
         let mut pipe = video.stdout.take().unwrap();
 
+        let mut clock = None;
         let audio = if let Some(audio_input) = &self.audio_input {
             let mut a = Command::new(tool("ffplay"));
+            // -loglevel error still prints the status line we take the clock from.
             a.args(["-nodisp", "-autoexit", "-loglevel", "error"]);
             if start_secs > 0.0 {
                 a.args(["-ss", &format!("{start_secs:.3}")]);
             }
-            a.arg(audio_input).stdin(Stdio::null()).stdout(Stdio::null());
+            a.arg(audio_input).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
             match a.spawn() {
-                Ok(c) => Some(c),
+                Ok(mut c) => {
+                    let audio_clock = Arc::new(AudioClock::default());
+                    audio_clock.clone().watch(c.stderr.take().unwrap());
+                    clock = Some(audio_clock);
+                    Some(c)
+                }
                 Err(e) => {
                     eprintln!("audio: ffplay unavailable ({e}); playing without sound");
                     None
@@ -268,9 +276,11 @@ impl Decoder {
         let shared = Arc::new(Shared::default());
         shared.paused.store(paused, Ordering::Relaxed);
         let s = shared.clone();
-        let frame_time = Duration::from_secs_f64(1.0 / self.fps.clamp(1.0, 240.0));
+        let fps = self.fps.clamp(1.0, 240.0);
         let reader = thread::spawn(move || {
-            let mut t0 = Instant::now();
+            let started = Instant::now();
+            // Frame clock (instant, video time) for when there is no sound to follow.
+            let mut anchor: Option<(Instant, f64)> = None;
             let mut n: u32 = 0;
             while !s.stop.load(Ordering::Relaxed) {
                 let i = slots.free_slot();
@@ -282,27 +292,42 @@ impl Decoder {
                     break;
                 }
                 if n == 0 {
-                    // Pace from the first frame, not from when ffmpeg started:
-                    // after a seek the stream can take a second to open.
-                    eprintln!("video: first frame decoded after {:.2}s", t0.elapsed().as_secs_f64());
-                    t0 = Instant::now();
+                    eprintln!("video: first frame decoded after {:.2}s", started.elapsed().as_secs_f64());
                 }
-                let due = t0 + frame_time * n;
-                let now = Instant::now();
-                if due > now {
-                    thread::sleep(due - now);
-                } else if now - due > frame_time * 30 {
-                    eprintln!("video: decoder running {:.0} ms behind", (now - due).as_secs_f64() * 1e3);
+                // Hold the frame until the sound reaches it. Without sound (or
+                // before it starts, for a while) follow the frame rate instead.
+                let pts = start_secs + n as f64 / fps;
+                while !s.stop.load(Ordering::Relaxed) && !s.paused.load(Ordering::Relaxed) {
+                    let heard = clock.as_ref().filter(|c| !c.gone()).map(|c| c.now());
+                    let wait = match heard {
+                        Some(Some(t)) => {
+                            anchor = None;
+                            if t - pts > 0.5 && n % 60 == 0 {
+                                eprintln!("video: {:.0} ms behind the sound", (t - pts) * 1e3);
+                            }
+                            pts - t
+                        }
+                        Some(None) if started.elapsed() < Duration::from_secs(8) => 0.005,
+                        _ => {
+                            let (at, from) = *anchor.get_or_insert((Instant::now(), pts));
+                            pts - from - at.elapsed().as_secs_f64()
+                        }
+                    };
+                    if wait <= 0.002 {
+                        break;
+                    }
+                    thread::sleep(Duration::from_secs_f64(wait.min(0.01)));
                 }
                 slots.publish(i);
                 n += 1;
                 s.frames.store(n as u64, Ordering::Relaxed);
-                // While paused, hold the next frame back and shift the clock.
-                let paused_at = Instant::now();
-                while s.paused.load(Ordering::Relaxed) && !s.stop.load(Ordering::Relaxed) {
-                    thread::sleep(Duration::from_millis(10));
+                // While paused, hold the next frame back; the frame clock restarts after.
+                if s.paused.load(Ordering::Relaxed) {
+                    while s.paused.load(Ordering::Relaxed) && !s.stop.load(Ordering::Relaxed) {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    anchor = None;
                 }
-                t0 += paused_at.elapsed();
             }
         });
 
@@ -311,6 +336,66 @@ impl Decoder {
             p.signal_audio("-STOP");
         }
         Ok(p)
+    }
+}
+
+/// ffplay's audio clock, read from the status line it prints every 30 ms
+/// ("  12.34 M-A: ..."): the video time of the sound being heard.
+#[derive(Default)]
+struct AudioClock {
+    state: Mutex<ClockState>,
+}
+
+#[derive(Default)]
+struct ClockState {
+    value: Option<f64>,
+    changed_at: Option<Instant>,
+    gone: bool,
+}
+
+impl AudioClock {
+    /// Current sound position, smoothed between ffplay's 30 ms updates.
+    fn now(&self) -> Option<f64> {
+        let s = self.state.lock().unwrap();
+        Some(s.value? + s.changed_at?.elapsed().as_secs_f64().min(0.05))
+    }
+
+    /// ffplay has exited (end of the sound, or an error).
+    fn gone(&self) -> bool {
+        self.state.lock().unwrap().gone
+    }
+
+    fn watch(self: Arc<Self>, mut stderr: ChildStderr) {
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut line = Vec::new();
+            while let Ok(len) = stderr.read(&mut buf) {
+                if len == 0 {
+                    break;
+                }
+                for &b in &buf[..len] {
+                    if b != b'\r' && b != b'\n' {
+                        line.push(b);
+                        continue;
+                    }
+                    let text = String::from_utf8_lossy(&line).into_owned();
+                    line.clear();
+                    if text.contains("M-A:") {
+                        let value = text.split_whitespace().next().and_then(|v| v.parse::<f64>().ok());
+                        if let Some(v) = value.filter(|v| v.is_finite()) {
+                            let mut s = self.state.lock().unwrap();
+                            if s.value != Some(v) {
+                                s.value = Some(v);
+                                s.changed_at = Some(Instant::now());
+                            }
+                        }
+                    } else if !text.trim().is_empty() {
+                        eprintln!("audio: {}", text.trim());
+                    }
+                }
+            }
+            self.state.lock().unwrap().gone = true;
+        });
     }
 }
 
