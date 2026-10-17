@@ -838,6 +838,8 @@ fn run(args: Args) -> Result<(), String> {
         let mut have_frame = false;
         let mut texture_layout = vk::ImageLayout::UNDEFINED;
         let mut frames_uploaded: u64 = 0;
+        let mut last_display: Option<i64> = None;
+        let mut timing = Timing::default();
         let mut started = Instant::now();
         // Turn applied to the video so "Recenter" puts its front where you look.
         let mut recenter = xr::Quaternionf { x: 0.0, y: 0.0, z: 0.0, w: 1.0 };
@@ -882,6 +884,27 @@ fn run(args: Args) -> Result<(), String> {
             }
 
             let state = frame_wait.wait().map_err(|e| e.to_string())?;
+            let work_start = Instant::now();
+            // Display timing: a gap of more than one display period between
+            // our frames means the compositor showed an old one again.
+            let period = state.predicted_display_period.as_nanos().max(1);
+            if let Some(last) = last_display {
+                if state.predicted_display_time.as_nanos() - last > period * 3 / 2 {
+                    timing.missed += 1;
+                }
+            }
+            last_display = Some(state.predicted_display_time.as_nanos());
+            timing.frames += 1;
+            if timing.frames == 900 {
+                eprintln!(
+                    "render: {} display frames at {:.1} ms, {} missed, slowest frame took {:.1} ms",
+                    timing.frames,
+                    period as f64 / 1e6,
+                    timing.missed,
+                    timing.slowest.as_secs_f64() * 1e3
+                );
+                timing = Timing::default();
+            }
             frame_stream.begin().map_err(|e| e.to_string())?;
             let now = state.predicted_display_time;
 
@@ -1180,6 +1203,7 @@ fn run(args: Args) -> Result<(), String> {
                 layers.push(&quad_layer);
             }
             frame_stream.end(now, blend_mode, &layers).map_err(|e| e.to_string())?;
+            timing.slowest = timing.slowest.max(work_start.elapsed());
         }
 
         drop(playback);
@@ -1289,6 +1313,14 @@ unsafe fn upload_panel(device: &ash::Device, cmd: vk::CommandBuffer, src: vk::Bu
             )],
         );
     }
+}
+
+/// Display-side timing over the last stretch of frames, for the log.
+#[derive(Default)]
+struct Timing {
+    frames: u32,
+    missed: u32,
+    slowest: Duration,
 }
 
 /// One plane of the video texture pair.

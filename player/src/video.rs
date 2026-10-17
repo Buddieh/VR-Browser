@@ -407,7 +407,7 @@ impl AudioClock {
     /// Current sound position, smoothed between ffplay's 30 ms updates.
     fn now(&self) -> Option<f64> {
         let s = self.state.lock().unwrap();
-        Some(s.value? + s.changed_at?.elapsed().as_secs_f64().min(0.05))
+        Some(s.value? + s.changed_at?.elapsed().as_secs_f64().min(0.2))
     }
 
     /// ffplay has exited (end of the sound, or an error).
@@ -488,13 +488,15 @@ impl Playback {
         let heard = self.clock.as_ref().filter(|c| !c.gone()).and_then(|c| c.now());
         if let Some((at, t)) = self.anchor.as_mut() {
             if let Some(h) = heard {
-                // Steer smoothly towards the sound; jump only when far off.
+                // Steer gently towards the sound (at most 1 ms per frame, which
+                // can't be seen); jump only when far off.
                 let err = h - (*t + at.elapsed().as_secs_f64());
-                if err.abs() > 0.15 {
+                if err.abs() > 0.5 {
+                    eprintln!("video: clock re-synced to the sound ({:+.0} ms)", err * 1e3);
                     *at = Instant::now();
                     *t = h;
                 } else {
-                    *t += err * 0.05;
+                    *t += (err * 0.02).clamp(-0.001, 0.001);
                 }
             }
         } else if let Some(h) = heard {
