@@ -46,6 +46,13 @@ detected from the video's metadata or title, otherwise it starts on a flat
 screen; YouTube's cube-shaped 360 format is recognised automatically. Every run writes
 `~/vr-player.log`; paste it into the project thread if something looks wrong.
 
+**Checking sources:** `~/.local/bin/vr-player --check` tries a built-in list of
+sites and formats (YouTube 360 and 4K, Vimeo, direct MP4, HLS, DASH, the local
+samples) without the headset: it finds the streams, picks the decoder, decodes
+from the start and after a seek, opens the sound, and prints what will play
+smoothly and what won't. Give it your own pages or files to test those
+instead: `vr-player --check URL ...`. The report goes to `~/vr-player.log`.
+
 Options: `--mode 360|cube|180|flat`, `--stereo mono|sbs|tb`, `--sw` (software
 decode, for comparison), `--start SECONDS`, `--max-width N` (default 4096),
 `--screen METERS` (flat screen width).

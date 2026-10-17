@@ -74,7 +74,7 @@ pub fn probe(input: &str) -> Result<VideoInfo, String> {
         has_audio: Command::new(tool("ffprobe"))
             .args(["-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", input])
             .output()
-            .map(|o| !o.stdout.is_empty())
+            .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
             .unwrap_or(false),
     })
 }
@@ -248,8 +248,12 @@ impl Decoder {
         // with exactly the arguments playback uses, so a failure here is
         // logged with ffmpeg's own message.
         let web = input.starts_with("http://") || input.starts_with("https://");
+        // Streaming playlists (HLS, DASH) open each segment themselves, and
+        // refuse segments behind "async:"; they buffer on their own anyway.
+        let lower = input.to_ascii_lowercase();
+        let playlist = [".m3u8", ".mpd", "manifest", "/hls", "/dash"].iter().any(|p| lower.contains(p));
         let mut candidates: Vec<(Option<&'static str>, bool)> = Vec::new();
-        for read_ahead in if web { &[true, false][..] } else { &[false][..] } {
+        for read_ahead in if web && !playlist { &[true, false][..] } else { &[false][..] } {
             if want_hw && let Some(hw) = hw_decoder(&info.codec) {
                 candidates.push((Some(hw), *read_ahead));
             }
@@ -298,6 +302,38 @@ impl Decoder {
         }
         a.extend(["-pix_fmt".into(), "nv12".into(), "-f".into(), "rawvideo".into()]);
         a
+    }
+
+    /// Decode from `start_secs` as playback would, without showing anything:
+    /// how long the first frame takes, and the rate after it. Stops after
+    /// `max_frames` frames or `max_secs` seconds.
+    pub fn benchmark(&self, start_secs: f64, frame_bytes: usize, max_frames: u32, max_secs: f64) -> Result<Bench, String> {
+        let mut child = Command::new(tool("ffmpeg"))
+            .args(["-loglevel", "error"])
+            .args(self.decode_args(start_secs))
+            .arg("pipe:1")
+            .stdout(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("could not run ffmpeg: {e}"))?;
+        let mut pipe = child.stdout.take().unwrap();
+        let mut buf = vec![0u8; frame_bytes];
+        let started = Instant::now();
+        let mut first = None;
+        let mut frames = 0;
+        while frames < max_frames && started.elapsed().as_secs_f64() < max_secs {
+            if pipe.read_exact(&mut buf).is_err() {
+                break;
+            }
+            first.get_or_insert(started.elapsed().as_secs_f64());
+            frames += 1;
+        }
+        let total = started.elapsed().as_secs_f64();
+        let _ = child.kill();
+        let _ = child.wait();
+        let first = first.ok_or("ffmpeg delivered no frames")?;
+        let fps = if frames > 1 { (frames - 1) as f64 / (total - first).max(1e-3) } else { 0.0 };
+        Ok(Bench { first_frame: first, fps, frames })
     }
 
     /// Start playing at `start_secs`, writing frames into `slots`.
@@ -397,10 +433,43 @@ impl Decoder {
             start_secs,
         };
         if paused {
-            p.signal_audio("-STOP");
+            p.signal_audio(SIGSTOP);
         }
         Ok(p)
     }
+}
+
+pub struct Bench {
+    /// Seconds until the first frame came out.
+    pub first_frame: f64,
+    /// Frames per second after the first.
+    pub fps: f64,
+    pub frames: u32,
+}
+
+/// Open the sound at `start_secs` the way playback does (decoding about two
+/// seconds of it): seconds to open, and where ffplay's own seek would have
+/// started the sound before trimming.
+pub fn audio_check(input: &str, start_secs: f64) -> Result<(f64, Option<f64>), String> {
+    let started = Instant::now();
+    let out = Command::new(tool("ffmpeg"))
+        .args(["-v", "error", "-nostdin"])
+        .args(["-ss", &format!("{start_secs:.3}"), "-i", input, "-vn", "-sn"])
+        .args(["-af", &format!("atrim=start={start_secs:.3}"), "-t", "2", "-f", "null", "-"])
+        .output()
+        .map_err(|e| format!("could not run ffmpeg: {e}"))?;
+    let took = started.elapsed().as_secs_f64();
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr);
+        return Err(msg.lines().last().unwrap_or("ffmpeg failed").trim().to_string());
+    }
+    let lands = Command::new(tool("ffprobe"))
+        .args(["-v", "error", "-select_streams", "a:0", "-read_intervals", &format!("{start_secs:.3}%+#1")])
+        .args(["-show_entries", "packet=pts_time", "-of", "csv=p=0", input])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).lines().next().and_then(|l| l.trim().trim_end_matches(',').parse().ok()));
+    Ok((took, lands))
 }
 
 /// ffplay's audio clock, read from the status line it prints every 30 ms
@@ -607,7 +676,14 @@ impl Playback {
         }
         let now = Instant::now();
         if paused {
-            self.paused_at = Some(self.clock(now).unwrap_or(self.position()));
+            // Freeze on the frame on screen. Not the sound's position: when
+            // the picture lags (slow decoding), frames up to there would keep
+            // playing after the sound stopped.
+            let lag = self.clock(now).map_or(0.0, |c| c - self.position());
+            if lag > 0.2 {
+                eprintln!("video: paused with the picture {:.0} ms behind the sound", lag * 1e3);
+            }
+            self.paused_at = Some(self.position());
         } else {
             // Restart the clock where it stopped; the sound picks up there
             // too. If the sound never started (paused straight after a seek,
@@ -621,23 +697,27 @@ impl Playback {
             self.easing = false;
             self.far_since = None;
         }
-        self.signal_audio(if paused { "-STOP" } else { "-CONT" });
+        self.signal_audio(if paused { SIGSTOP } else { SIGCONT });
     }
 
     /// Freeze or continue the audio player (ffplay has no pause command on a pipe).
-    fn signal_audio(&self, signal: &str) {
+    fn signal_audio(&self, signal: i32) {
         if let Some(a) = &self.audio {
-            let _ = Command::new("kill").arg(signal).arg(a.id().to_string()).status();
+            // SAFETY: plain syscall on our own child's pid.
+            unsafe { kill(a.id() as i32, signal) };
         }
     }
 
     /// Stop decoding and sound, and drop queued frames; safe to call more than once.
     pub fn stop(&mut self) {
         self.shared.stop.store(true, Ordering::Relaxed);
+        // Wake the reader if it is waiting for a free slot.
+        self.slots.freed.notify_all();
         let _ = self.video.kill();
         let _ = self.video.wait();
         if let Some(mut a) = self.audio.take() {
-            let _ = Command::new("kill").arg("-CONT").arg(a.id().to_string()).status();
+            // SAFETY: as above.
+            unsafe { kill(a.id() as i32, SIGCONT) };
             let _ = a.kill();
             let _ = a.wait();
         }
@@ -649,6 +729,13 @@ impl Playback {
         }
     }
 }
+
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+// Linux signal numbers (aarch64 and x86_64).
+const SIGCONT: i32 = 18;
+const SIGSTOP: i32 = 19;
 
 /// `later - earlier` in seconds, negative when `later` is earlier.
 fn secs_between(later: Instant, earlier: Instant) -> f64 {

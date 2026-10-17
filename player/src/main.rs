@@ -7,6 +7,7 @@
 //! has no equirect composition layers, so the app does this projection itself.
 //! A control panel (ui.rs) floats in front of the viewer as a quad layer.
 
+mod check;
 mod source;
 mod ui;
 mod video;
@@ -77,6 +78,8 @@ impl Stereo {
 
 struct Args {
     input: String,
+    /// `--check`: test these sources (none = a built-in list) instead of playing.
+    check: Option<Vec<String>>,
     /// `None` = detect from the video's metadata or title.
     projection: Option<Projection>,
     stereo: Option<Stereo>,
@@ -88,6 +91,7 @@ struct Args {
 
 const USAGE: &str = "usage: vr-player <file-or-url> [--mode 360|cube|180|flat] [--stereo mono|sbs|tb] \
 [--sw] [--max-width N] [--start SECONDS] [--screen METERS]
+       vr-player --check [file-or-url ...]   (test sources without the headset)
 
 The input can be a video file, a direct video URL, or a web page (YouTube and
 other sites supported by yt-dlp). Without --mode/--stereo the layout is
@@ -102,6 +106,7 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
     let mut a = Args {
         input: String::new(),
+        check: None,
         projection: None,
         stereo: None,
         hw: true,
@@ -130,15 +135,19 @@ fn parse_args() -> Result<Args, String> {
                 })
             }
             "--sw" => a.hw = false,
+            "--check" => a.check = Some(Vec::new()),
             "--max-width" => a.max_width = val("--max-width")?.parse().map_err(|_| "bad --max-width")?,
             "--start" => a.start = val("--start")?.parse().map_err(|_| "bad --start")?,
             "--screen" => a.screen_m = val("--screen")?.parse().map_err(|_| "bad --screen")?,
             "-h" | "--help" => return Err(String::new()),
             s if s.starts_with("--") => return Err(format!("unknown option {s}")),
-            s => a.input = s.to_string(),
+            s => match a.check.as_mut() {
+                Some(list) => list.push(s.to_string()),
+                None => a.input = s.to_string(),
+            },
         }
     }
-    if a.input.is_empty() {
+    if a.input.is_empty() && a.check.is_none() {
         return Err("no video given".into());
     }
     Ok(a)
@@ -155,6 +164,10 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if let Some(list) = &args.check {
+        let ok = check::run(list, args.max_width, args.hw);
+        std::process::exit(if ok { 0 } else { 1 });
+    }
     if let Err(e) = run(args) {
         eprintln!("error: {e}");
         std::process::exit(1);
@@ -1037,8 +1050,10 @@ fn run(args: Args) -> Result<(), String> {
                 continue;
             }
 
+            let mut lap = Instant::now();
             let state = frame_wait.wait().map_err(|e| e.to_string())?;
             let work_start = Instant::now();
+            timing.lap(Phase::Wait, &mut lap);
             // Display timing: a gap of more than one display period between
             // our frames means the compositor showed an old one again.
             let period = state.predicted_display_period.as_nanos().max(1);
@@ -1055,6 +1070,7 @@ fn run(args: Args) -> Result<(), String> {
             }
             frame_stream.begin().map_err(|e| e.to_string())?;
             let now = state.predicted_display_time;
+            timing.lap(Phase::Begin, &mut lap);
 
             // --- Input ---------------------------------------------------------------
             session.sync_actions(&[(&actions).into()]).map_err(|e| e.to_string())?;
@@ -1175,6 +1191,7 @@ fn run(args: Args) -> Result<(), String> {
             // refreshes and motion would jump. Instead, like mpv's
             // "oversample", each refresh shows the frame current at its start
             // and blends in the next one by how much of the refresh it covers.
+            timing.lap(Phase::Input, &mut lap);
             let period_s = state.predicted_display_period.as_nanos() as f64 / 1e9;
             let ratio = 1.0 / (period_s * info.fps).max(1e-3);
             let blending = blend && (ratio - ratio.round()).abs() > 0.02 && !playback.paused();
@@ -1194,9 +1211,11 @@ fn run(args: Args) -> Result<(), String> {
                 continue;
             }
 
+            timing.lap(Phase::Pick, &mut lap);
             let (_, views) = session.locate_views(VIEW_TYPE, now, &space).map_err(|e| e.to_string())?;
             let index = swapchain.acquire_image().map_err(|e| e.to_string())? as usize;
             swapchain.wait_image(xr::Duration::INFINITE).map_err(|e| e.to_string())?;
+            timing.lap(Phase::Acquire, &mut lap);
 
             device
                 .begin_command_buffer(
@@ -1365,11 +1384,13 @@ fn run(args: Args) -> Result<(), String> {
                 device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, query_pool, 1);
             }
             device.end_command_buffer(cmd).map_err(vkerr)?;
+            timing.lap(Phase::Record, &mut lap);
             device
                 .queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence)
                 .map_err(vkerr)?;
             device.wait_for_fences(&[fence], true, u64::MAX).map_err(vkerr)?;
             device.reset_fences(&[fence]).map_err(vkerr)?;
+            timing.lap(Phase::Gpu, &mut lap);
             let mut stamps = [0u64; 2];
             if timestamps
                 && device
@@ -1420,6 +1441,7 @@ fn run(args: Args) -> Result<(), String> {
                 layers.push(&quad_layer);
             }
             frame_stream.end(now, blend_mode, &layers).map_err(|e| e.to_string())?;
+            timing.lap(Phase::End, &mut lap);
             timing.work.push(work_start.elapsed().as_secs_f32() * 1e3);
         }
 
@@ -1577,7 +1599,9 @@ fn match_refresh_rate(instance: &xr::Instance, session: &xr::Session<xr::Vulkan>
 struct DisplayClock {
     instance: xr::sys::Instance,
     convert: Option<xr::raw::ConvertTimespecTimeKHR>,
-    /// Without the conversion: an instant and display time matched once.
+    /// An instant and the display time at that instant, matched with the
+    /// conversion once a second (the two clocks run together), or once from
+    /// an estimate without it.
     base: Option<(Instant, i64)>,
 }
 
@@ -1603,28 +1627,40 @@ impl DisplayClock {
     }
 
     fn instant(&mut self, t: xr::Time, period: xr::Duration) -> Instant {
-        let at = |i: Instant, nanos: i64| {
-            if nanos >= 0 { i + Duration::from_nanos(nanos as u64) } else { i - Duration::from_nanos(nanos.unsigned_abs()) }
+        let stale = self.base.is_none_or(|(i, _)| self.convert.is_some() && i.elapsed() > Duration::from_secs(1));
+        if stale {
+            self.base = Some(self.match_now().unwrap_or_else(|| {
+                // Frames are typically seen about two refreshes after the wait returns.
+                (Instant::now(), t.as_nanos() - 2 * period.as_nanos())
+            }));
+        }
+        let (i0, t0) = self.base.unwrap();
+        let nanos = t.as_nanos() - t0;
+        if nanos >= 0 { i0 + Duration::from_nanos(nanos as u64) } else { i0 - Duration::from_nanos(nanos.unsigned_abs()) }
+    }
+
+    /// The display time now, from the runtime's conversion.
+    fn match_now(&mut self) -> Option<(Instant, i64)> {
+        let c = self.convert.as_ref()?;
+        let now = Instant::now();
+        let mut ts = Timespec::default();
+        let mut xr_now = xr::Time::from_nanos(0);
+        // SAFETY: valid instance; Instant is CLOCK_MONOTONIC on Linux.
+        let ok = unsafe {
+            clock_gettime(CLOCK_MONOTONIC, &mut ts) == 0
+                && (c.convert_timespec_time_to_time)(self.instance, (&ts as *const Timespec).cast(), &mut xr_now)
+                    == xr::sys::Result::SUCCESS
         };
-        if let Some(c) = &self.convert {
-            let now = Instant::now();
-            let mut ts = Timespec::default();
-            let mut xr_now = xr::Time::from_nanos(0);
-            // SAFETY: valid instance; Instant is CLOCK_MONOTONIC on Linux.
-            let ok = unsafe {
-                clock_gettime(CLOCK_MONOTONIC, &mut ts) == 0
-                    && (c.convert_timespec_time_to_time)(self.instance, (&ts as *const Timespec).cast(), &mut xr_now)
-                        == xr::sys::Result::SUCCESS
-            };
-            if ok {
-                return at(now, t.as_nanos() - xr_now.as_nanos());
-            }
+        let took = now.elapsed();
+        if took > Duration::from_millis(2) {
+            eprintln!("openxr: display clock conversion took {:.1} ms", took.as_secs_f64() * 1e3);
+        }
+        if !ok {
             eprintln!("openxr: display clock conversion failed; estimating instead");
             self.convert = None;
+            return None;
         }
-        // Frames are typically seen about two refreshes after the wait returns.
-        let (i0, t0) = *self.base.get_or_insert((Instant::now(), t.as_nanos() - 2 * period.as_nanos()));
-        at(i0, t.as_nanos() - t0)
+        Some((now, xr_now.as_nanos()))
     }
 }
 
@@ -1641,9 +1677,51 @@ struct Timing {
     holds: [u32; 5],
     /// Refreshes that blended two video frames.
     blended: u32,
+    /// Milliseconds spent in each part of the frame loop.
+    phases: [Vec<f32>; Phase::ALL.len()],
+}
+
+/// Parts of the frame loop, timed separately for the log.
+#[derive(Clone, Copy)]
+enum Phase {
+    /// Blocked in xrWaitFrame (pacing; expected).
+    Wait,
+    Begin,
+    /// Controllers and panel logic.
+    Input,
+    /// Choosing the video frame.
+    Pick,
+    /// Locating the eyes and getting a swapchain image.
+    Acquire,
+    /// Recording GPU commands (and drawing the panel).
+    Record,
+    /// Waiting for the GPU.
+    Gpu,
+    /// Releasing images and submitting the frame.
+    End,
+}
+
+impl Phase {
+    const ALL: [(Phase, &'static str); 8] = [
+        (Phase::Wait, "wait"),
+        (Phase::Begin, "begin"),
+        (Phase::Input, "input"),
+        (Phase::Pick, "pick"),
+        (Phase::Acquire, "acquire"),
+        (Phase::Record, "record"),
+        (Phase::Gpu, "gpu"),
+        (Phase::End, "end"),
+    ];
 }
 
 impl Timing {
+    /// Time since `since` counts towards `phase`; restart from now.
+    fn lap(&mut self, phase: Phase, since: &mut Instant) {
+        let now = Instant::now();
+        self.phases[phase as usize].push((now - *since).as_secs_f32() * 1e3);
+        *since = now;
+    }
+
     fn report(&mut self, period_ms: f64) {
         // (median, 99th percentile, slowest) in milliseconds.
         let spread = |v: &mut Vec<f32>| {
@@ -1660,6 +1738,14 @@ impl Timing {
              slowest {gmax:.1} ms",
             self.frames, self.missed,
         );
+        let parts: Vec<String> = Phase::ALL
+            .iter()
+            .map(|&(phase, name)| {
+                let (m, p99, _) = spread(&mut self.phases[phase as usize]);
+                format!("{name} {m:.1} ({p99:.1})")
+            })
+            .collect();
+        eprintln!("render: median (99%) ms per part: {}", parts.join(", "));
         let [h1, h2, h3, h4, h5] = self.holds;
         eprintln!(
             "render: video frames held for 1/2/3/4/5+ refreshes: {h1}/{h2}/{h3}/{h4}/{h5}; {} refreshes blended",
