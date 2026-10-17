@@ -276,8 +276,9 @@ impl Decoder {
         let mut clock = None;
         let audio = if let Some(audio_input) = &self.audio_input {
             let mut a = Command::new(tool("ffplay"));
-            // -loglevel error still prints the status line we take the clock from.
-            a.args(["-nodisp", "-autoexit", "-loglevel", "error"]);
+            // -stats makes ffplay print its status line (which we take the
+            // clock from) even at -loglevel error; ffmpeg 7 hides it otherwise.
+            a.args(["-nodisp", "-autoexit", "-loglevel", "error", "-stats"]);
             if start_secs > 0.0 {
                 a.args(["-ss", &format!("{start_secs:.3}")]);
             }
@@ -344,8 +345,11 @@ impl Decoder {
                             }
                             pts - t
                         }
-                        Some(None) if started.elapsed() < Duration::from_secs(8) => 0.005,
+                        Some(None) if started.elapsed() < Duration::from_secs(3) => 0.005,
                         _ => {
+                            if anchor.is_none() && clock.is_some() && n < 2 {
+                                eprintln!("audio: no clock from ffplay yet; following the frame rate");
+                            }
                             let (at, from) = *anchor.get_or_insert((Instant::now(), pts));
                             pts - from - at.elapsed().as_secs_f64()
                         }
@@ -421,6 +425,9 @@ impl AudioClock {
                         let value = text.split_whitespace().next().and_then(|v| v.parse::<f64>().ok());
                         if let Some(v) = value.filter(|v| v.is_finite()) {
                             let mut s = self.state.lock().unwrap();
+                            if s.value.is_none() {
+                                eprintln!("audio: playing from {v:.2}s");
+                            }
                             if s.value != Some(v) {
                                 s.value = Some(v);
                                 s.changed_at = Some(Instant::now());
