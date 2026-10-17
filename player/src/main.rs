@@ -303,6 +303,10 @@ fn run(args: Args) -> Result<(), String> {
     }
     let mut enabled = xr::ExtensionSet::default();
     enabled.khr_vulkan_enable2 = true;
+    // Lets us pick a display refresh rate that suits the video's frame rate.
+    enabled.fb_display_refresh_rate = available.fb_display_refresh_rate;
+    // Tells when each frame will actually be on the display.
+    enabled.khr_convert_timespec_time = available.khr_convert_timespec_time;
     let instance = entry
         .create_instance(
             &xr::ApplicationInfo {
@@ -594,9 +598,14 @@ fn run(args: Args) -> Result<(), String> {
         );
         let panel = ui::Panel::new(color_format == vk::Format::B8G8R8A8_SRGB);
 
-        // --- Video textures: full-size luma (R8) and half-size chroma (R8G8) ---------
+        // --- Video textures: two sets (the frame on screen and the next one, for
+        // blending), each a full-size luma (R8) and half-size chroma (R8G8) plane.
         let mut planes = Vec::new();
-        for (format, w, h) in [(vk::Format::R8_UNORM, width, height), (vk::Format::R8G8_UNORM, width / 2, height / 2)] {
+        for (format, w, h) in [(vk::Format::R8_UNORM, width, height), (vk::Format::R8G8_UNORM, width / 2, height / 2)]
+            .into_iter()
+            .cycle()
+            .take(4)
+        {
             let image = device
                 .create_image(
                     &vk::ImageCreateInfo::default()
@@ -658,7 +667,7 @@ fn run(args: Args) -> Result<(), String> {
         // --- Pipeline ---------------------------------------------------------------
         let set_layout = device
             .create_descriptor_set_layout(
-                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&[0, 1].map(|binding| {
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&[0, 1, 2, 3].map(|binding| {
                     vk::DescriptorSetLayoutBinding::default()
                         .binding(binding)
                         .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -684,7 +693,7 @@ fn run(args: Args) -> Result<(), String> {
             .create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&[vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                    descriptor_count: 2,
+                    descriptor_count: 4,
                 }]),
                 None,
             )
@@ -836,10 +845,18 @@ fn run(args: Args) -> Result<(), String> {
         let mut running = false;
         let mut quitting = false;
         let mut have_frame = false;
-        let mut texture_layout = vk::ImageLayout::UNDEFINED;
+        // Which frame (by time) each texture set holds.
+        let mut set_pts: [Option<f64>; 2] = [None, None];
+        // The set holding the frame on screen.
+        let mut a_set = 0usize;
         let mut frames_uploaded: u64 = 0;
         let mut last_display: Option<i64> = None;
         let mut timing = Timing::default();
+        let mut display_clock = DisplayClock::new(&instance);
+        // Refreshes the frame on screen has been shown for.
+        let mut held = 0u32;
+        // Blend neighbouring frames when the refresh rate doesn't fit the video.
+        let mut blend = true;
         let mut started = Instant::now();
         // Turn applied to the video so "Recenter" puts its front where you look.
         let mut recenter = xr::Quaternionf { x: 0.0, y: 0.0, z: 0.0, w: 1.0 };
@@ -865,6 +882,7 @@ fn run(args: Args) -> Result<(), String> {
                             xr::SessionState::READY => {
                                 session.begin(VIEW_TYPE).map_err(|e| e.to_string())?;
                                 running = true;
+                                match_refresh_rate(&instance, &session, info.fps);
                             }
                             xr::SessionState::STOPPING => {
                                 session.end().map_err(|e| e.to_string())?;
@@ -875,6 +893,9 @@ fn run(args: Args) -> Result<(), String> {
                         }
                     }
                     xr::Event::InstanceLossPending(_) => break 'main,
+                    xr::Event::DisplayRefreshRateChangedFB(e) => {
+                        eprintln!("openxr: display refresh now {} Hz", e.to_display_refresh_rate());
+                    }
                     _ => {}
                 }
             }
@@ -896,13 +917,7 @@ fn run(args: Args) -> Result<(), String> {
             last_display = Some(state.predicted_display_time.as_nanos());
             timing.frames += 1;
             if timing.frames == 900 {
-                eprintln!(
-                    "render: {} display frames at {:.1} ms, {} missed, slowest frame took {:.1} ms",
-                    timing.frames,
-                    period as f64 / 1e6,
-                    timing.missed,
-                    timing.slowest.as_secs_f64() * 1e3
-                );
+                timing.report(period as f64 / 1e6);
                 timing = Timing::default();
             }
             frame_stream.begin().map_err(|e| e.to_string())?;
@@ -994,6 +1009,10 @@ fn run(args: Args) -> Result<(), String> {
                         stereo = stereo.next();
                         eprintln!("input: stereo {stereo:?}");
                     }
+                    ui::Control::Blend => {
+                        blend = !blend;
+                        eprintln!("input: frame blending {}", if blend { "on" } else { "off" });
+                    }
                     ui::Control::Recenter => {
                         if let Some(h) = head_pose {
                             recenter = yaw_of(h.orientation);
@@ -1018,10 +1037,22 @@ fn run(args: Args) -> Result<(), String> {
                 panel_shown = false;
             }
 
+            // When the display rate isn't a whole multiple of the frame rate
+            // (30 fps on 72 Hz), frames would alternate between 2 and 3
+            // refreshes and motion would jump. Instead, like mpv's
+            // "oversample", each refresh shows the frame current at its start
+            // and blends in the next one by how much of the refresh it covers.
+            let period_s = state.predicted_display_period.as_nanos() as f64 / 1e9;
+            let ratio = 1.0 / (period_s * info.fps).max(1e-3);
+            let blending = blend && (ratio - ratio.round()).abs() > 0.02 && !playback.paused();
+            // Video time at the moment this frame will be on the display.
+            let seen_at = display_clock.instant(state.predicted_display_time, state.predicted_display_period);
+            let due = playback.clock(seen_at).unwrap_or(f64::NEG_INFINITY);
+            let pick = if blending { due - period_s / 2.0 } else { due };
             // The newest decoded frame whose time has come (the first one of a
             // new playback at once, so a seek shows its picture straight away).
-            let due = playback.clock().unwrap_or(f64::NEG_INFINITY);
-            let new_frame = slots.take_due(due, playback.fresh());
+            let fresh = playback.fresh();
+            let new_frame = slots.take_due(pick, fresh);
             if !state.should_render || (!have_frame && new_frame.is_none()) {
                 if let Some((slot, _)) = new_frame {
                     slots.release(slot);
@@ -1041,7 +1072,21 @@ fn run(args: Args) -> Result<(), String> {
                 )
                 .map_err(vkerr)?;
 
+            if new_frame.is_some() {
+                // How long the previous frame stayed up (not across seeks).
+                if !fresh && held > 0 {
+                    timing.holds[held.min(5) as usize - 1] += 1;
+                }
+                held = 0;
+            }
+            if !playback.paused() {
+                held += 1;
+            }
             if let Some((slot, pts)) = new_frame {
+                if fresh {
+                    // A new playback: frames kept from before a seek may share times with its frames.
+                    set_pts = [None, None];
+                }
                 playback.showing(pts);
                 if check_cube && frames_uploaded % 15 == 0 {
                     match video::looks_like_eac(slots.slot(slot), width as usize, height as usize) {
@@ -1056,8 +1101,14 @@ fn run(args: Args) -> Result<(), String> {
                         None => {}
                     }
                 }
-                upload_frame(&device, cmd, stages[slot].0, &planes, chroma_offset, texture_layout);
-                texture_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+                // Often already uploaded as last display frame's "next" frame.
+                if let Some(k) = set_pts.iter().position(|p| *p == Some(pts)) {
+                    a_set = k;
+                } else {
+                    a_set = 1 - a_set;
+                    upload_frame(&device, cmd, stages[slot].0, &planes[a_set * 2..a_set * 2 + 2], chroma_offset);
+                    set_pts[a_set] = Some(pts);
+                }
                 have_frame = true;
                 frames_uploaded += 1;
                 if frames_uploaded % 300 == 0 {
@@ -1068,6 +1119,23 @@ fn run(args: Args) -> Result<(), String> {
                         slots.skipped()
                     );
                     started = Instant::now();
+                }
+            }
+
+            let mut weight = 0.0;
+            if blending
+                && due.is_finite()
+                && let Some((next_slot, next_pts)) = slots.peek_next()
+            {
+                let w = ((pick + period_s - next_pts) / period_s).clamp(0.0, 1.0);
+                if w > 0.0 {
+                    let b = 1 - a_set;
+                    if set_pts[b] != Some(next_pts) {
+                        upload_frame(&device, cmd, stages[next_slot].0, &planes[b * 2..b * 2 + 2], chroma_offset);
+                        set_pts[b] = Some(next_pts);
+                    }
+                    weight = w as f32;
+                    timing.blended += 1;
                 }
             }
 
@@ -1082,6 +1150,7 @@ fn run(args: Args) -> Result<(), String> {
                     ended: playback.ended(),
                     picture: projection.label(),
                     stereo: stereo.label(),
+                    blend,
                     hover,
                     cursors: pointers.iter().flatten().map(|&(x, y)| (x as i32, y as i32)).collect(),
                 };
@@ -1119,7 +1188,7 @@ fn run(args: Args) -> Result<(), String> {
                     pos: [pos.x, pos.y, pos.z, 0.0],
                     rect: eye_rect(stereo, eye),
                     params: [mode, args.screen_m, args.screen_m / video_aspect, args.screen_m],
-                    color: [info.bt601 as u32 as f32, info.full_range as u32 as f32, 0.0, 0.0],
+                    color: [info.bt601 as u32 as f32, info.full_range as u32 as f32, weight, a_set as f32],
                 };
                 device.cmd_begin_render_pass(
                     cmd,
@@ -1203,7 +1272,7 @@ fn run(args: Args) -> Result<(), String> {
                 layers.push(&quad_layer);
             }
             frame_stream.end(now, blend_mode, &layers).map_err(|e| e.to_string())?;
-            timing.slowest = timing.slowest.max(work_start.elapsed());
+            timing.work.push(work_start.elapsed().as_secs_f32() * 1e3);
         }
 
         drop(playback);
@@ -1315,12 +1384,127 @@ unsafe fn upload_panel(device: &ash::Device, cmd: vk::CommandBuffer, src: vk::Bu
     }
 }
 
+/// Ask the headset for a refresh rate that is a whole multiple of the video's
+/// frame rate (90 or 120 Hz for 30 fps), so every video frame stays on screen
+/// for the same number of refreshes. Needs XR_FB_display_refresh_rate.
+fn match_refresh_rate(instance: &xr::Instance, session: &xr::Session<xr::Vulkan>, fps: f64) {
+    if instance.exts().fb_display_refresh_rate.is_none() {
+        eprintln!("openxr: this runtime can't change the refresh rate; blending frames instead");
+        return;
+    }
+    let (Ok(rates), Ok(current)) = (session.enumerate_display_refresh_rates(), session.get_display_refresh_rate()) else {
+        eprintln!("openxr: could not read the display refresh rates");
+        return;
+    };
+    eprintln!("openxr: display refresh {current} Hz, available {rates:?}");
+    let fits = |r: f32| {
+        let k = (r as f64 / fps).round();
+        k >= 1.0 && (r as f64 / fps - k).abs() < 0.02
+    };
+    if fits(current) {
+        return;
+    }
+    // The fastest matching rate up to 120 Hz: smoother head motion too.
+    let Some(best) = rates.iter().copied().filter(|&r| fits(r) && r <= 120.5).reduce(f32::max) else {
+        eprintln!("openxr: no refresh rate fits {fps:.2} fps; blending frames instead");
+        return;
+    };
+    match session.request_display_refresh_rate(best) {
+        Ok(()) => eprintln!("openxr: asked for {best} Hz to match {fps:.2} fps video"),
+        Err(e) => eprintln!("openxr: could not switch to {best} Hz: {e}"),
+    }
+}
+
+/// Turns the runtime's display times into `Instant`s, to time the picture by
+/// when it will be seen rather than when it happens to be drawn (which
+/// wobbles with scheduling).
+struct DisplayClock {
+    instance: xr::sys::Instance,
+    convert: Option<xr::raw::ConvertTimespecTimeKHR>,
+    /// Without the conversion: an instant and display time matched once.
+    base: Option<(Instant, i64)>,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct Timespec {
+    sec: i64,
+    nsec: i64,
+}
+
+unsafe extern "C" {
+    fn clock_gettime(clock: i32, ts: *mut Timespec) -> i32;
+}
+const CLOCK_MONOTONIC: i32 = 1;
+
+impl DisplayClock {
+    fn new(instance: &xr::Instance) -> Self {
+        let convert = instance.exts().khr_convert_timespec_time;
+        if convert.is_none() {
+            eprintln!("openxr: no display clock conversion; estimating when frames are seen");
+        }
+        Self { instance: instance.as_raw(), convert, base: None }
+    }
+
+    fn instant(&mut self, t: xr::Time, period: xr::Duration) -> Instant {
+        let at = |i: Instant, nanos: i64| {
+            if nanos >= 0 { i + Duration::from_nanos(nanos as u64) } else { i - Duration::from_nanos(nanos.unsigned_abs()) }
+        };
+        if let Some(c) = &self.convert {
+            let now = Instant::now();
+            let mut ts = Timespec::default();
+            let mut xr_now = xr::Time::from_nanos(0);
+            // SAFETY: valid instance; Instant is CLOCK_MONOTONIC on Linux.
+            let ok = unsafe {
+                clock_gettime(CLOCK_MONOTONIC, &mut ts) == 0
+                    && (c.convert_timespec_time_to_time)(self.instance, (&ts as *const Timespec).cast(), &mut xr_now)
+                        == xr::sys::Result::SUCCESS
+            };
+            if ok {
+                return at(now, t.as_nanos() - xr_now.as_nanos());
+            }
+            eprintln!("openxr: display clock conversion failed; estimating instead");
+            self.convert = None;
+        }
+        // Frames are typically seen about two refreshes after the wait returns.
+        let (i0, t0) = *self.base.get_or_insert((Instant::now(), t.as_nanos() - 2 * period.as_nanos()));
+        at(i0, t.as_nanos() - t0)
+    }
+}
+
 /// Display-side timing over the last stretch of frames, for the log.
 #[derive(Default)]
 struct Timing {
     frames: u32,
     missed: u32,
-    slowest: Duration,
+    /// Milliseconds from the frame wait returning to the frame submitted.
+    work: Vec<f32>,
+    /// How many video frames stayed on screen for 1, 2, 3, 4, 5+ refreshes.
+    holds: [u32; 5],
+    /// Refreshes that blended two video frames.
+    blended: u32,
+}
+
+impl Timing {
+    fn report(&mut self, period_ms: f64) {
+        self.work.sort_by(f32::total_cmp);
+        let n = self.work.len().max(1);
+        let pct = |p: usize| self.work.get((n * p / 100).min(n - 1)).copied().unwrap_or(0.0);
+        eprintln!(
+            "render: {} display frames at {period_ms:.1} ms, {} missed; work per frame: median {:.1} ms, \
+             99% under {:.1} ms, slowest {:.1} ms",
+            self.frames,
+            self.missed,
+            pct(50),
+            pct(99),
+            self.work.last().copied().unwrap_or(0.0),
+        );
+        let [h1, h2, h3, h4, h5] = self.holds;
+        eprintln!(
+            "render: video frames held for 1/2/3/4/5+ refreshes: {h1}/{h2}/{h3}/{h4}/{h5}; {} refreshes blended",
+            self.blended
+        );
+    }
 }
 
 /// One plane of the video texture pair.
@@ -1340,7 +1524,6 @@ unsafe fn upload_frame(
     src: vk::Buffer,
     planes: &[Plane],
     chroma_offset: u64,
-    old_layout: vk::ImageLayout,
 ) {
     let range = vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -1373,8 +1556,9 @@ unsafe fn upload_frame(
             vk::DependencyFlags::empty(),
             &[],
             &[],
+            // The old contents are replaced whole, so their layout doesn't matter.
             &barriers(
-                old_layout,
+                vk::ImageLayout::UNDEFINED,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::AccessFlags::SHADER_READ,
                 vk::AccessFlags::TRANSFER_WRITE,

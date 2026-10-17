@@ -33,8 +33,13 @@ it; the first time, allow Chromium to open the VR player.
 
 Controls: a panel floats in front of you. Point a controller at it (a white
 dot shows where) and pull the **trigger** to click: seek bar, play/pause,
-skip 10 s, picture type (360 / 360 cube / 180 / flat), 3D layout, recenter
-and quit. Without the panel: **A** or **X** pauses, the **thumbstick**
+skip 10 s, picture type (360 / 360 cube / 180 / flat), 3D layout, recenter,
+smooth motion and quit. Smooth motion matters when the headset's refresh rate
+isn't a multiple of the video's frame rate (30 fps on 72 Hz): on, it blends
+neighbouring frames where the picture changes; off, frames alternate between
+two and three refreshes, which shows as a regular jump. A 90 or 120 Hz
+refresh rate avoids the problem for 30 fps video; the player asks for one when
+the headset allows. Without the panel: **A** or **X** pauses, the **thumbstick**
 left/right skips 10 s, **B** or **Y** (or a trigger pull off the panel) shows
 or hides it. The panel hides itself after 8 seconds of playback. The layout is
 detected from the video's metadata or title, otherwise it starts on a flat

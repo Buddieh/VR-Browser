@@ -16,6 +16,8 @@ pub enum Control {
     Picture,
     Stereo,
     Recenter,
+    /// Blend neighbouring frames on refreshes where the picture changes.
+    Blend,
     Quit,
     /// Seek bar, at this fraction of the video.
     Seek(f32),
@@ -32,6 +34,7 @@ pub struct View {
     pub ended: bool,
     pub picture: &'static str,
     pub stereo: &'static str,
+    pub blend: bool,
     pub hover: Option<Control>,
     /// Pointer dots, in panel pixels.
     pub cursors: Vec<(i32, i32)>,
@@ -54,13 +57,14 @@ const SEEK_BAR: Rect = Rect { x: 40, y: 92, w: 944, h: 26 };
 /// The seek bar reacts a little above and below what is drawn.
 const SEEK_HIT: Rect = Rect { x: 30, y: 72, w: 964, h: 66 };
 
-const BUTTONS: [(Control, Rect); 7] = [
+const BUTTONS: [(Control, Rect); 8] = [
     (Control::Back, Rect { x: 40, y: 180, w: 160, h: 90 }),
     (Control::PlayPause, Rect { x: 215, y: 180, w: 200, h: 90 }),
     (Control::Forward, Rect { x: 430, y: 180, w: 160, h: 90 }),
     (Control::Picture, Rect { x: 605, y: 180, w: 190, h: 90 }),
     (Control::Stereo, Rect { x: 810, y: 180, w: 174, h: 90 }),
     (Control::Recenter, Rect { x: 40, y: 290, w: 300, h: 70 }),
+    (Control::Blend, Rect { x: 355, y: 290, w: 414, h: 70 }),
     (Control::Quit, Rect { x: 784, y: 290, w: 200, h: 70 }),
 ];
 
@@ -178,6 +182,7 @@ impl Panel {
                 Control::Picture => ("Picture", view.picture),
                 Control::Stereo => ("3D", view.stereo),
                 Control::Recenter => ("", "Recenter"),
+                Control::Blend => ("", if view.blend { "Smooth motion: On" } else { "Smooth motion: Off" }),
                 Control::Quit => ("", "Quit"),
                 Control::Seek(_) => ("", ""),
             };
@@ -240,9 +245,12 @@ impl Canvas<'_> {
     }
 
     fn fill(&mut self, r: &Rect, c: Rgb) {
+        let c = if self.bgra { [c[2], c[1], c[0]] } else { c };
+        let px = [c[0], c[1], c[2], 255];
+        let (x0, x1) = (r.x.min(W), (r.x + r.w).min(W));
         for y in r.y..(r.y + r.h).min(H) {
-            for x in r.x..(r.x + r.w).min(W) {
-                self.put(x, y, c, 255);
+            for p in self.px[(y * W + x0) * 4..(y * W + x1) * 4].chunks_exact_mut(4) {
+                p.copy_from_slice(&px);
             }
         }
     }

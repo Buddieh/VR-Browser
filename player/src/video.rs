@@ -153,6 +153,12 @@ impl FrameSlots {
         chosen
     }
 
+    /// Renderer: the next queued frame, left in the queue. Its slot can be
+    /// read until the next `take_due` (the reader never writes queued slots).
+    pub fn peek_next(&self) -> Option<(usize, f64)> {
+        self.state.lock().unwrap().ready.front().copied()
+    }
+
     /// Renderer: done with a slot from `take_due` (its GPU copy has finished).
     pub fn release(&self, i: usize) {
         self.state.lock().unwrap().free.push(i);
@@ -313,7 +319,11 @@ impl Decoder {
             // clock from) even at -loglevel error; ffmpeg 7 hides it otherwise.
             a.args(["-nodisp", "-autoexit", "-loglevel", "error", "-stats"]);
             if start_secs > 0.0 {
+                // ffplay seeks to the packet group before the target (seconds
+                // early in YouTube's audio), and plays from there; drop that
+                // part so the sound starts where the picture does.
                 a.args(["-ss", &format!("{start_secs:.3}")]);
+                a.args(["-af", &format!("atrim=start={start_secs:.3}")]);
             }
             a.arg(audio_input).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
             match a.spawn() {
@@ -376,8 +386,12 @@ impl Decoder {
             shared,
             slots,
             reader: Some(reader),
-            started: Instant::now(),
+            waiting_since: Instant::now(),
             anchor: None,
+            drift: 0.0,
+            easing: false,
+            far_since: None,
+            deaf_until: None,
             shown: None,
             paused_at: paused.then_some(start_secs),
             start_secs,
@@ -467,9 +481,20 @@ pub struct Playback {
     shared: Arc<Shared>,
     slots: Arc<FrameSlots>,
     reader: Option<thread::JoinHandle<()>>,
-    started: Instant,
+    /// Since when the picture has been waiting for the sound to start.
+    waiting_since: Instant,
     /// Playback clock: video time `.1` at instant `.0`, kept close to the sound.
     anchor: Option<(Instant, f64)>,
+    /// How far the sound is ahead of the picture, smoothed over ffplay's
+    /// coarse readings (10 ms steps, every 30 ms).
+    drift: f64,
+    /// The clock is being eased back towards the sound.
+    easing: bool,
+    /// Since when the sound has been far from the picture.
+    far_since: Option<Instant>,
+    /// Ignore ffplay's clock until then: right after a pause it reports one
+    /// value that runs on by the length of the pause.
+    deaf_until: Option<Instant>,
     /// Time of the frame on screen.
     shown: Option<f64>,
     /// Video time while paused.
@@ -478,38 +503,79 @@ pub struct Playback {
 }
 
 impl Playback {
-    /// Video time the picture should show now: follows the sound when there
-    /// is any, else the wall clock from the first frame. `None` before
-    /// playback has started (the first frame is still shown at once).
-    pub fn clock(&mut self) -> Option<f64> {
+    /// Video time the picture seen at instant `at` should show: follows the
+    /// sound when there is any, else the wall clock from the first frame.
+    /// `None` before playback has started (the first frame is still shown at
+    /// once). Pass when the frame will actually be on the display, not when
+    /// it is drawn, so frames change on an even beat.
+    pub fn clock(&mut self, at: Instant) -> Option<f64> {
         if let Some(t) = self.paused_at {
             return Some(t);
         }
-        let heard = self.clock.as_ref().filter(|c| !c.gone()).and_then(|c| c.now());
-        if let Some((at, t)) = self.anchor.as_mut() {
-            if let Some(h) = heard {
-                // Steer gently towards the sound (at most 1 ms per frame, which
-                // can't be seen); jump only when far off.
-                let err = h - (*t + at.elapsed().as_secs_f64());
-                if err.abs() > 0.5 {
-                    eprintln!("video: clock re-synced to the sound ({:+.0} ms)", err * 1e3);
-                    *at = Instant::now();
-                    *t = h;
-                } else {
-                    *t += (err * 0.02).clamp(-0.001, 0.001);
+        let now = Instant::now();
+        let heard = self
+            .clock
+            .as_ref()
+            .filter(|c| !c.gone() && self.deaf_until.is_none_or(|d| now >= d))
+            .and_then(|c| c.now());
+        match (self.anchor, heard) {
+            (Some((a_at, a_t)), Some(h)) => self.steer(h, h - (a_t + secs_between(now, a_at)), now),
+            (None, Some(h)) => {
+                self.anchor = Some((now, h));
+                self.drift = 0.0;
+            }
+            (None, None) => {
+                if let Some(t) = self.shown
+                    && (self.clock.is_none() || self.waiting_since.elapsed() > Duration::from_secs(3))
+                {
+                    if self.clock.is_some() {
+                        eprintln!("audio: no clock from ffplay; following the frame rate");
+                    }
+                    self.anchor = Some((now, t));
                 }
             }
-        } else if let Some(h) = heard {
-            self.anchor = Some((Instant::now(), h));
-        } else if let Some(t) = self.shown
-            && (self.clock.is_none() || self.started.elapsed() > Duration::from_secs(3))
-        {
-            if self.clock.is_some() {
-                eprintln!("audio: no clock from ffplay; following the frame rate");
-            }
-            self.anchor = Some((Instant::now(), t));
+            (Some(_), None) => {}
         }
-        self.anchor.map(|(at, t)| t + at.elapsed().as_secs_f64())
+        self.anchor.map(|(a_at, a_t)| a_t + secs_between(at, a_at))
+    }
+
+    /// Keep the clock with the sound, which is `err` seconds ahead (`heard`
+    /// is the sound's position now).
+    fn steer(&mut self, heard: f64, err: f64, now: Instant) {
+        // Far off (a stall in the sound, or the sound restarted): jump, but
+        // only once it lasts, so one odd reading can't throw the picture.
+        if err.abs() > 0.5 {
+            let since = *self.far_since.get_or_insert(now);
+            if now - since > Duration::from_millis(300) {
+                eprintln!("video: clock re-synced to the sound ({:+.0} ms)", err * 1e3);
+                self.anchor = Some((now, heard));
+                self.drift = 0.0;
+                self.easing = false;
+                self.far_since = None;
+            }
+            return;
+        }
+        self.far_since = None;
+        self.drift += (err - self.drift) * 0.05;
+        // Leave small differences alone: every nudge moves where frame
+        // changes fall between display refreshes, which shows as uneven
+        // motion. Ease back (at most 0.5 ms per frame, which can't be seen)
+        // only when the picture is noticeably off.
+        if self.drift.abs() > 0.040 {
+            if !self.easing {
+                eprintln!("video: picture {:+.0} ms off the sound; easing back", -self.drift * 1e3);
+            }
+            self.easing = true;
+        } else if self.drift.abs() < 0.010 {
+            self.easing = false;
+        }
+        if self.easing
+            && let Some((_, t)) = self.anchor.as_mut()
+        {
+            let step = (self.drift * 0.02).clamp(-0.0005, 0.0005);
+            *t += step;
+            self.drift -= step;
+        }
     }
 
     /// Renderer: a frame with time `t` is now on screen.
@@ -539,11 +605,21 @@ impl Playback {
         if self.paused() == paused {
             return;
         }
+        let now = Instant::now();
         if paused {
-            self.paused_at = Some(self.clock().unwrap_or(self.position()));
+            self.paused_at = Some(self.clock(now).unwrap_or(self.position()));
         } else {
-            // Restart the clock where it stopped; the sound picks up there too.
-            self.anchor = self.paused_at.take().map(|t| (Instant::now(), t));
+            // Restart the clock where it stopped; the sound picks up there
+            // too. If the sound never started (paused straight after a seek,
+            // before ffplay had opened the stream), wait for it instead.
+            let heard = self.clock.as_ref().is_some_and(|c| c.now().is_some());
+            let t = self.paused_at.take();
+            self.anchor = t.filter(|_| heard || self.clock.is_none()).map(|t| (now, t));
+            self.waiting_since = now;
+            self.deaf_until = Some(now + Duration::from_millis(250));
+            self.drift = 0.0;
+            self.easing = false;
+            self.far_since = None;
         }
         self.signal_audio(if paused { "-STOP" } else { "-CONT" });
     }
@@ -571,6 +647,14 @@ impl Playback {
             let _ = r.join();
             self.slots.clear();
         }
+    }
+}
+
+/// `later - earlier` in seconds, negative when `later` is earlier.
+fn secs_between(later: Instant, earlier: Instant) -> f64 {
+    match later.checked_duration_since(earlier) {
+        Some(d) => d.as_secs_f64(),
+        None => -(earlier - later).as_secs_f64(),
     }
 }
 
