@@ -48,11 +48,10 @@ pub fn resolve(input: &str, max_width: u32) -> Result<Source, String> {
         // YouTube needs a JavaScript runtime to unlock its streams.
         cmd.arg("--js-runtimes").arg(format!("deno:{}", deno.display()));
     }
-    let out = cmd
-        .args(["--no-playlist", "--no-warnings", "-f", &format])
-        .args(["--print", "title", "--print", "urls", input])
-        .output()
-        .map_err(|e| format!("could not run yt-dlp ({}): {e}", ytdlp.display()))?;
+    let out = crate::video::output_within(
+        cmd.args(["--no-playlist", "--no-warnings", "-f", &format]).args(["--print", "title", "--print", "urls", input]),
+        90,
+    )?;
     if !out.status.success() {
         return Err(format!(
             "yt-dlp could not find a video on that page: {}",
@@ -84,11 +83,12 @@ pub fn probe_hints(video: &str) -> Hints {
     if lower.contains("vproj%3dmesh") || lower.contains("vproj=mesh") {
         h.projection = Some(Projection::Cube360);
     }
-    let Ok(out) = Command::new("/usr/bin/ffprobe")
-        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream_side_data"])
-        .args(["-of", "default=nw=1", video])
-        .output()
-    else {
+    let Ok(out) = crate::video::output_within(
+        Command::new("/usr/bin/ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream_side_data"])
+            .args(["-of", "default=nw=1", video]),
+        30,
+    ) else {
         return h;
     };
     let text = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();

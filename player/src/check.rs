@@ -65,9 +65,11 @@ pub fn run(given: &[String], max_width: u32, hw: bool) -> bool {
 fn check_one(input: &str, max_width: u32, hw: bool) -> Result<Vec<String>, String> {
     let mut problems = Vec::new();
     let t = Instant::now();
+    eprintln!("    finding the streams...");
     let src = source::resolve(input, max_width)?;
     eprintln!("    found streams in {:.1}s; title \"{}\"", t.elapsed().as_secs_f64(), src.title);
 
+    eprintln!("    reading the stream details...");
     let info = video::probe(&src.video)?;
     let (width, height) = video::output_size(&info, max_width);
     let duration = info.duration;
@@ -106,6 +108,7 @@ fn check_one(input: &str, max_width: u32, hw: bool) -> Result<Vec<String>, Strin
     );
 
     let audio = src.audio.clone().or_else(|| info.has_audio.then(|| src.video.clone()));
+    eprintln!("    testing decoders...");
     let decoder = video::Decoder::new(&src.video, audio.as_deref(), &info, (width, height), hw)?;
     let hw_used = decoder.is_hw();
     eprintln!("    decoder: {}", if hw_used { "hardware" } else { "software" });
@@ -116,7 +119,10 @@ fn check_one(input: &str, max_width: u32, hw: bool) -> Result<Vec<String>, Strin
     // Playback needs the decoder comfortably faster than the video.
     let frame_bytes = width as usize * height as usize * 3 / 2;
     let need = info.fps.max(1.0);
-    let rate = |label: &str, start: f64, problems: &mut Vec<String>| match decoder.benchmark(start, frame_bytes, 150, 10.0) {
+    let rate = |label: &str, start: f64, problems: &mut Vec<String>| match {
+        eprintln!("    decoding {label}...");
+        decoder.benchmark(start, frame_bytes, 150, 10.0)
+    } {
         Ok(b) => {
             eprintln!(
                 "    decode {label}: first frame after {:.2}s, then {:.0} fps ({} frames; needs {need:.0})",
@@ -124,7 +130,7 @@ fn check_one(input: &str, max_width: u32, hw: bool) -> Result<Vec<String>, Strin
             );
             if b.frames > 10 && b.fps < need * 1.2 {
                 problems.push(format!(
-                    "decoding {label} too slow: {:.0} fps for {need:.0} fps video ({} decoder), will stutter",
+                    "frames {label} came too slowly: {:.0} fps for {need:.0} fps video ({} decoder, or the network), will stutter",
                     b.fps,
                     if hw_used { "hardware" } else { "software" }
                 ));
@@ -147,6 +153,7 @@ fn check_one(input: &str, max_width: u32, hw: bool) -> Result<Vec<String>, Strin
         None => eprintln!("    sound: none"),
         Some(a) => {
             let at = seek_to.unwrap_or(0.0);
+            eprintln!("    opening the sound...");
             match video::audio_check(a, at) {
                 Ok((took, lands)) => {
                     eprintln!(

@@ -14,7 +14,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     io::Read,
-    process::{Child, ChildStderr, Command, Stdio},
+    process::{Child, ChildStderr, Command, Output, Stdio},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -36,18 +36,52 @@ pub struct VideoInfo {
     pub duration: Option<f64>,
 }
 
+/// Run `cmd` to completion like `Command::output`, but give up (killing it)
+/// after `secs` seconds: network streams can stall forever.
+pub fn output_within(cmd: &mut Command, secs: u64) -> Result<Output, String> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run {:?}: {e}", cmd.get_program()))?;
+    let drain = |mut r: Box<dyn Read + Send>| {
+        thread::spawn(move || {
+            let mut v = Vec::new();
+            let _ = r.read_to_end(&mut v);
+            v
+        })
+    };
+    let out = drain(Box::new(child.stdout.take().unwrap()));
+    let err = drain(Box::new(child.stderr.take().unwrap()));
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{:?} gave no answer in {secs}s", cmd.get_program()));
+            }
+        }
+    };
+    Ok(Output { status, stdout: out.join().unwrap_or_default(), stderr: err.join().unwrap_or_default() })
+}
+
 fn tool(name: &str) -> String {
     let sys = format!("/usr/bin/{name}");
     if std::path::Path::new(&sys).exists() { sys } else { name.to_string() }
 }
 
 pub fn probe(input: &str) -> Result<VideoInfo, String> {
-    let out = Command::new(tool("ffprobe"))
+    let out = output_within(
+        Command::new(tool("ffprobe"))
         .args(["-v", "error", "-select_streams", "v:0"])
         .args(["-show_entries", "stream=codec_name,width,height,avg_frame_rate,r_frame_rate,color_space,color_range:format=duration"])
-        .args(["-of", "default=nw=1", input])
-        .output()
-        .map_err(|e| format!("could not run ffprobe: {e}"))?;
+        .args(["-of", "default=nw=1", input]),
+        30,
+    )?;
     if !out.status.success() {
         return Err(format!("ffprobe failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
@@ -71,9 +105,12 @@ pub fn probe(input: &str) -> Result<VideoInfo, String> {
         height,
         fps: rate("avg_frame_rate").or_else(|| rate("r_frame_rate")).unwrap_or(30.0),
         duration: kv.get("duration").and_then(|v| v.parse().ok()).filter(|d: &f64| *d > 0.0),
-        has_audio: Command::new(tool("ffprobe"))
-            .args(["-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", input])
-            .output()
+        has_audio: output_within(
+            Command::new(tool("ffprobe")).args([
+                "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", input,
+            ]),
+            30,
+        )
             .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
             .unwrap_or(false),
     })
@@ -262,16 +299,25 @@ impl Decoder {
         for (candidate, read_ahead) in candidates {
             d.decoder = candidate;
             d.video_url = if read_ahead { format!("async:{input}") } else { input.to_string() };
-            let check = Command::new(tool("ffmpeg"))
-                .args(["-loglevel", "warning"])
-                .args(d.decode_args(0.0))
-                .args(["-frames:v", "1", "-y", "/dev/null"])
-                .stdin(Stdio::null())
-                .output()
-                .map_err(|e| format!("could not run ffmpeg: {e}"))?;
-            if check.status.success() {
-                return Ok(d);
-            }
+            let check = output_within(
+                Command::new(tool("ffmpeg"))
+                    .args(["-loglevel", "warning"])
+                    .args(d.decode_args(0.0))
+                    .args(["-frames:v", "1", "-y", "/dev/null"]),
+                30,
+            );
+            let check = match check {
+                Ok(c) if c.status.success() => return Ok(d),
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "video: decoder {}{} failed its test: {e}",
+                        candidate.unwrap_or("software"),
+                        if read_ahead { " with read-ahead" } else { "" }
+                    );
+                    continue;
+                }
+            };
             eprintln!(
                 "video: decoder {}{} failed its test. ffmpeg said:",
                 candidate.unwrap_or("software"),
@@ -317,6 +363,25 @@ impl Decoder {
             .spawn()
             .map_err(|e| format!("could not run ffmpeg: {e}"))?;
         let mut pipe = child.stdout.take().unwrap();
+        // A stalled stream would block the read below for ever: kill ffmpeg
+        // a little after the time limit, which ends the read.
+        let done = Arc::new(AtomicBool::new(false));
+        let watchdog = {
+            let done = done.clone();
+            let pid = child.id() as i32;
+            thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs_f64(max_secs + 5.0);
+                while !done.load(Ordering::Relaxed) {
+                    if Instant::now() > deadline {
+                        // SAFETY: plain syscall on our own child's pid (not yet reaped).
+                        unsafe { kill(pid, SIGKILL) };
+                        return true;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                false
+            })
+        };
         let mut buf = vec![0u8; frame_bytes];
         let started = Instant::now();
         let mut first = None;
@@ -329,9 +394,11 @@ impl Decoder {
             frames += 1;
         }
         let total = started.elapsed().as_secs_f64();
+        done.store(true, Ordering::Relaxed);
+        let stalled = watchdog.join().unwrap_or(false);
         let _ = child.kill();
         let _ = child.wait();
-        let first = first.ok_or("ffmpeg delivered no frames")?;
+        let first = first.ok_or(if stalled { "no frame arrived (stream stalled)" } else { "ffmpeg delivered no frames" })?;
         let fps = if frames > 1 { (frames - 1) as f64 / (total - first).max(1e-3) } else { 0.0 };
         Ok(Bench { first_frame: first, fps, frames })
     }
@@ -452,22 +519,25 @@ pub struct Bench {
 /// started the sound before trimming.
 pub fn audio_check(input: &str, start_secs: f64) -> Result<(f64, Option<f64>), String> {
     let started = Instant::now();
-    let out = Command::new(tool("ffmpeg"))
-        .args(["-v", "error", "-nostdin"])
-        .args(["-ss", &format!("{start_secs:.3}"), "-i", input, "-vn", "-sn"])
-        .args(["-af", &format!("atrim=start={start_secs:.3}"), "-t", "2", "-f", "null", "-"])
-        .output()
-        .map_err(|e| format!("could not run ffmpeg: {e}"))?;
+    let out = output_within(
+        Command::new(tool("ffmpeg"))
+            .args(["-v", "error", "-nostdin"])
+            .args(["-ss", &format!("{start_secs:.3}"), "-i", input, "-vn", "-sn"])
+            .args(["-af", &format!("atrim=start={start_secs:.3}"), "-t", "2", "-f", "null", "-"]),
+        30,
+    )?;
     let took = started.elapsed().as_secs_f64();
     if !out.status.success() {
         let msg = String::from_utf8_lossy(&out.stderr);
         return Err(msg.lines().last().unwrap_or("ffmpeg failed").trim().to_string());
     }
-    let lands = Command::new(tool("ffprobe"))
-        .args(["-v", "error", "-select_streams", "a:0", "-read_intervals", &format!("{start_secs:.3}%+#1")])
-        .args(["-show_entries", "packet=pts_time", "-of", "csv=p=0", input])
-        .output()
-        .ok()
+    let lands = output_within(
+        Command::new(tool("ffprobe"))
+            .args(["-v", "error", "-select_streams", "a:0", "-read_intervals", &format!("{start_secs:.3}%+#1")])
+            .args(["-show_entries", "packet=pts_time", "-of", "csv=p=0", input]),
+        15,
+    )
+    .ok()
         .and_then(|o| String::from_utf8_lossy(&o.stdout).lines().next().and_then(|l| l.trim().trim_end_matches(',').parse().ok()));
     Ok((took, lands))
 }
@@ -734,6 +804,7 @@ unsafe extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
 }
 // Linux signal numbers (aarch64 and x86_64).
+const SIGKILL: i32 = 9;
 const SIGCONT: i32 = 18;
 const SIGSTOP: i32 = 19;
 
