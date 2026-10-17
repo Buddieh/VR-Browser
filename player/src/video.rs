@@ -430,7 +430,9 @@ impl AudioClock {
                     }
                     let text = String::from_utf8_lossy(&line).into_owned();
                     line.clear();
-                    if text.contains("M-A:") {
+                    // Status lines end in "fd= ... aq= ..."; before the sound
+                    // starts they read "nan" and carry no clock yet.
+                    if text.contains("fd=") {
                         let value = text.split_whitespace().next().and_then(|v| v.parse::<f64>().ok());
                         if let Some(v) = value.filter(|v| v.is_finite()) {
                             let mut s = self.state.lock().unwrap();
