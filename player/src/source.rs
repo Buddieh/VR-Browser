@@ -12,6 +12,9 @@ pub struct Source {
     /// `None` to take audio from `video` when it has any.
     pub audio: Option<String>,
     pub title: String,
+    /// The site's own video stream address, when `video` is a local
+    /// parallel-download server in front of it (see `fetch`).
+    pub origin: String,
 }
 
 const MEDIA_EXTENSIONS: &[&str] = &[".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".ts", ".m3u8", ".mpd"];
@@ -31,7 +34,9 @@ fn bundled(name: &str) -> Option<PathBuf> {
 pub fn resolve(input: &str, max_width: u32) -> Result<Source, String> {
     if !is_web_page(input) {
         let title = input.rsplit('/').next().unwrap_or(input).to_string();
-        return Ok(Source { video: input.to_string(), audio: None, title });
+        let web = input.starts_with("http://") || input.starts_with("https://");
+        let video = if web { parallel(input) } else { input.to_string() };
+        return Ok(Source { video, audio: None, title, origin: input.to_string() });
     }
 
     // Prefer codecs the Frame decodes in hardware (VP9, H.264, HEVC) at a
@@ -66,10 +71,28 @@ pub fn resolve(input: &str, max_width: u32) -> Result<Source, String> {
     let mut lines = text.lines().filter(|l| !l.trim().is_empty());
     let title = lines.next().unwrap_or("").to_string();
     let urls: Vec<String> = lines.map(str::to_string).collect();
-    let video = urls.first().cloned().ok_or("yt-dlp returned no stream URL")?;
-    let audio = urls.get(1).cloned();
+    let origin = urls.first().cloned().ok_or("yt-dlp returned no stream URL")?;
     eprintln!("source: \"{title}\" ({} stream{})", urls.len(), if urls.len() == 1 { "" } else { "s" });
-    Ok(Source { video, audio, title })
+    let video = parallel(&origin);
+    let audio = urls.get(1).map(|a| parallel(a));
+    Ok(Source { video, audio, title, origin })
+}
+
+/// `url` through a local parallel-download server (sites like YouTube limit
+/// each connection), or `url` itself when that can't be set up. Streaming
+/// playlists fetch their own segments and are left alone.
+fn parallel(url: &str) -> String {
+    let lower = url.to_ascii_lowercase();
+    if [".m3u8", ".mpd", "manifest"].iter().any(|p| lower.contains(p)) {
+        return url.to_string();
+    }
+    match crate::fetch::serve(url) {
+        Ok(local) => local,
+        Err(e) => {
+            eprintln!("source: downloading over one connection ({e})");
+            url.to_string()
+        }
+    }
 }
 
 /// Layout hints from ffprobe's spherical / stereo side data.

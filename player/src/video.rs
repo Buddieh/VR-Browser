@@ -291,19 +291,7 @@ impl Decoder {
         out: (u32, u32),
         want_hw: bool,
     ) -> Result<Self, String> {
-        let scale = (out.0, out.1) != (info.width, info.height);
-        let mut d = Self {
-            video_url: input.to_string(),
-            audio_input: audio_input.map(str::to_string),
-            audio_start: match audio_input {
-                Some(a) if a == input => info.start,
-                Some(a) => start_time(a),
-                None => 0.0,
-            },
-            filter: scale.then(|| format!("scale={}:{}:flags=bilinear", out.0, out.1)),
-            fps: info.fps,
-            decoder: None,
-        };
+        let mut d = Self::untested(input, audio_input, info, out, None);
         // Try the hardware decoder first, then software; for web streams,
         // first with ffmpeg's read-ahead buffer ("async:") so network hiccups
         // don't stall the picture. Each candidate is test-run for one frame
@@ -353,6 +341,30 @@ impl Decoder {
             }
         }
         Err("ffmpeg could not decode this video (see messages above)".into())
+    }
+
+    /// Decode `input` with `decoder` (`None` = software), without the test
+    /// run that `new` does.
+    pub fn untested(
+        input: &str,
+        audio_input: Option<&str>,
+        info: &VideoInfo,
+        out: (u32, u32),
+        decoder: Option<&'static str>,
+    ) -> Self {
+        let scale = (out.0, out.1) != (info.width, info.height);
+        Self {
+            video_url: input.to_string(),
+            audio_input: audio_input.map(str::to_string),
+            audio_start: match audio_input {
+                Some(a) if a == input => info.start,
+                Some(a) => start_time(a),
+                None => 0.0,
+            },
+            filter: scale.then(|| format!("scale={}:{}:flags=bilinear", out.0, out.1)),
+            fps: info.fps,
+            decoder,
+        }
     }
 
     pub fn is_hw(&self) -> bool {

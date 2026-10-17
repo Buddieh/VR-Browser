@@ -110,6 +110,80 @@ fn check_one(input: &str, max_width: u32, hw: bool) -> Result<Vec<String>, Strin
         }
     );
 
+    let frame_bytes = width as usize * height as usize * 3 / 2;
+    let need = info.fps.max(1.0);
+    let web = input.starts_with("http://") || input.starts_with("https://");
+    let seek_to = duration.filter(|d| *d > 30.0).map(|d| (d * 0.5).floor());
+
+    // Playback mixes two things: the network delivering the stream, and the
+    // decoder turning it into pictures. Download a short clip without
+    // decoding (network speed), then decode that clip with each decoder
+    // (decoder speed with the network out of the way).
+    if web {
+        let lower = src.origin.to_ascii_lowercase();
+        if ![".m3u8", ".mpd", "manifest"].iter().any(|p| lower.contains(p)) {
+            connections(&src.origin);
+        }
+        if src.video != src.origin {
+            eprintln!("    downloading in parallel pieces through {}", src.video.split('?').next().unwrap_or(""));
+        }
+        let clip = std::env::temp_dir().join(format!("vr-player-check-{}.mkv", std::process::id()));
+        let clip = clip.display().to_string();
+        let mut positions = vec![("from the start".to_string(), 0.0)];
+        positions.extend(seek_to.map(|t| (format!("at {t:.0}s"), t)));
+        for (label, at) in positions {
+            eprintln!("    downloading {CLIP_SECS:.0}s of video {label} without decoding...");
+            match video::fetch_clip(&src.video, at, CLIP_SECS, &clip) {
+                Ok(took) => {
+                    let speed = CLIP_SECS / took.max(1e-3);
+                    let mbit = std::fs::metadata(&clip).map_or(0.0, |m| m.len() as f64 * 8.0 / 1e6);
+                    eprintln!(
+                        "    network {label}: {CLIP_SECS:.0}s of video ({:.0} Mbit/s to play) arrived in {took:.1}s ({speed:.1}x playback speed, {:.0} Mbit/s)",
+                        mbit / CLIP_SECS,
+                        mbit / took.max(1e-3)
+                    );
+                    if speed < 1.3 {
+                        problems.push(format!(
+                            "network {label}: {CLIP_SECS:.0}s of video took {took:.1}s to arrive, too slow to play smoothly"
+                        ));
+                    }
+                }
+                Err(e) => {
+                    problems.push(format!("network {label}: download failed: {e}"));
+                    continue;
+                }
+            }
+            let mut speeds = Vec::new();
+            let mut decoders = vec![(None, "software")];
+            if hw {
+                if let Some(h) = video::hw_decoder(&info.codec) {
+                    decoders.insert(0, (Some(h), "hardware"));
+                }
+            }
+            for (d, name) in decoders {
+                match video::Decoder::untested(&clip, None, &info, (width, height), d).benchmark(0.0, frame_bytes, 150, 10.0) {
+                    Ok(b) => {
+                        eprintln!(
+                            "    {name} decoder on that clip: first frame after {:.2}s, then {:.0} fps ({} frames; needs {need:.0})",
+                            b.first_frame, b.fps, b.frames
+                        );
+                        speeds.push(b.fps);
+                    }
+                    Err(e) => {
+                        eprintln!("    {name} decoder on that clip: failed ({e})");
+                        if d.is_some() {
+                            problems.push(format!("hardware decoder failed on the clip {label}: {e}"));
+                        }
+                    }
+                }
+            }
+            if speeds.iter().all(|&f| f < need * 1.2) {
+                problems.push(format!("no decoder keeps up {label} even with the network out of the way"));
+            }
+        }
+        let _ = std::fs::remove_file(&clip);
+    }
+
     let audio = src.audio.clone().or_else(|| info.has_audio.then(|| src.video.clone()));
     eprintln!("    testing decoders...");
     let decoder = video::Decoder::new(&src.video, audio.as_deref(), &info, (width, height), hw)?;
@@ -120,9 +194,6 @@ fn check_one(input: &str, max_width: u32, hw: bool) -> Result<Vec<String>, Strin
     }
 
     // Playback needs the decoder comfortably faster than the video.
-    let frame_bytes = width as usize * height as usize * 3 / 2;
-    let need = info.fps.max(1.0);
-    let web = input.starts_with("http://") || input.starts_with("https://");
     // The same decoder reading the stream the other way (with or without
     // the read-ahead buffer), to see which one keeps up.
     let other_way = (web && decoder.read_ahead()).then(|| decoder.with_input(&src.video, decoder.hw_name()));
@@ -161,75 +232,10 @@ fn check_one(input: &str, max_width: u32, hw: bool) -> Result<Vec<String>, Strin
         }
     };
     rate("from the start", 0.0, &mut problems);
-    let seek_to = duration.filter(|d| *d > 30.0).map(|d| (d * 0.5).floor());
     if let Some(t) = seek_to {
         rate(&format!("after seeking to {t:.0}s"), t, &mut problems);
     } else {
         eprintln!("    seek: skipped (live or shorter than 30s)");
-    }
-
-    // Playback mixes two things: the network delivering the stream, and the
-    // decoder turning it into pictures. Download a short clip without
-    // decoding (network speed), then decode that clip with each decoder
-    // (decoder speed with the network out of the way).
-    if web {
-        let lower = src.video.to_ascii_lowercase();
-        if ![".m3u8", ".mpd", "manifest"].iter().any(|p| lower.contains(p)) {
-            connections(&src.video);
-        }
-        let clip = std::env::temp_dir().join(format!("vr-player-check-{}.mkv", std::process::id()));
-        let clip = clip.display().to_string();
-        let mut positions = vec![("from the start".to_string(), 0.0)];
-        positions.extend(seek_to.map(|t| (format!("at {t:.0}s"), t)));
-        for (label, at) in positions {
-            eprintln!("    downloading {CLIP_SECS:.0}s of video {label} without decoding...");
-            match video::fetch_clip(&src.video, at, CLIP_SECS, &clip) {
-                Ok(took) => {
-                    let speed = CLIP_SECS / took.max(1e-3);
-                    let mbit = std::fs::metadata(&clip).map_or(0.0, |m| m.len() as f64 * 8.0 / 1e6);
-                    eprintln!(
-                        "    network {label}: {CLIP_SECS:.0}s of video ({:.0} Mbit/s to play) arrived in {took:.1}s ({speed:.1}x playback speed, {:.0} Mbit/s)",
-                        mbit / CLIP_SECS,
-                        mbit / took.max(1e-3)
-                    );
-                    if speed < 1.3 {
-                        problems.push(format!(
-                            "network {label}: {CLIP_SECS:.0}s of video took {took:.1}s to arrive, too slow to play smoothly"
-                        ));
-                    }
-                }
-                Err(e) => {
-                    problems.push(format!("network {label}: download failed: {e}"));
-                    continue;
-                }
-            }
-            let mut decoders = vec![(None, "software")];
-            if hw {
-                if let Some(h) = video::hw_decoder(&info.codec) {
-                    decoders.insert(0, (Some(h), "hardware"));
-                }
-            }
-            for (d, name) in decoders {
-                match decoder.with_input(&clip, d).benchmark(0.0, frame_bytes, 150, 10.0) {
-                    Ok(b) => {
-                        eprintln!(
-                            "    {name} decoder on that clip: first frame after {:.2}s, then {:.0} fps ({} frames; needs {need:.0})",
-                            b.first_frame, b.fps, b.frames
-                        );
-                        if d.is_some() == hw_used && b.frames > 10 && b.fps < need * 1.2 {
-                            problems.push(format!("{name} decoder too slow {label}: {:.0} fps for {need:.0} fps video", b.fps));
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("    {name} decoder on that clip: failed ({e})");
-                        if d.is_some() == hw_used {
-                            problems.push(format!("{name} decoder failed on the clip {label}: {e}"));
-                        }
-                    }
-                }
-            }
-        }
-        let _ = std::fs::remove_file(&clip);
     }
 
     match &audio {

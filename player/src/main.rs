@@ -8,6 +8,7 @@
 //! A control panel (ui.rs) floats in front of the viewer as a quad layer.
 
 mod check;
+mod fetch;
 mod source;
 mod ui;
 mod video;
