@@ -454,8 +454,8 @@ impl Decoder {
         let total = started.elapsed().as_secs_f64();
         done.store(true, Ordering::Relaxed);
         let stalled = watchdog.join().unwrap_or(false);
-        let _ = child.kill();
-        let _ = child.wait();
+        drop(pipe);
+        end_ffmpeg(&mut child);
         let first = first.ok_or(if stalled { "no frame arrived (stream stalled)" } else { "ffmpeg delivered no frames" })?;
         let fps = if frames > 1 { (frames - 1) as f64 / (total - first).max(1e-3) } else { 0.0 };
         Ok(Bench { first_frame: first, fps, frames })
@@ -906,8 +906,7 @@ impl Playback {
         self.shared.stop.store(true, Ordering::Relaxed);
         // Wake the reader if it is waiting for a free slot.
         self.slots.freed.notify_all();
-        let _ = self.video.kill();
-        let _ = self.video.wait();
+        end_ffmpeg(&mut self.video);
         if let Some(mut a) = self.audio.take() {
             // SAFETY: as above.
             unsafe { kill(a.id() as i32, SIGCONT) };
@@ -928,8 +927,32 @@ unsafe extern "C" {
 }
 // Linux signal numbers (aarch64 and x86_64).
 const SIGKILL: i32 = 9;
+const SIGTERM: i32 = 15;
 const SIGCONT: i32 = 18;
 const SIGSTOP: i32 = 19;
+
+/// Stop a decoding ffmpeg the way it expects (SIGTERM; it then closes the
+/// decoder properly), killing it only if it hasn't exited after 3 s. Killed
+/// outright, ffmpeg leaves the Frame's hardware decoder busy for a while and
+/// the next one started (after a seek) stalls. Whoever reads its output
+/// must stop too, or close the pipe, so a blocked write can't hold it up.
+fn end_ffmpeg(child: &mut Child) {
+    if let Ok(Some(_)) = child.try_wait() {
+        return;
+    }
+    // SAFETY: plain syscall on our own child's pid (not yet reaped).
+    unsafe { kill(child.id() as i32, SIGTERM) };
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if let Ok(Some(_)) = child.try_wait() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    eprintln!("video: ffmpeg did not stop within 3s; killing it");
+    let _ = child.kill();
+    let _ = child.wait();
+}
 
 /// `later - earlier` in seconds, negative when `later` is earlier.
 fn secs_between(later: Instant, earlier: Instant) -> f64 {

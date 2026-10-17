@@ -160,6 +160,11 @@ fn check_one(input: &str, max_width: u32, hw: bool) -> Result<Vec<String>, Strin
                     decoders.insert(0, (Some(h), "hardware"));
                 }
             }
+            // Hardware twice in a row: a seek stops one decoder and starts
+            // the next straight away, which must work too.
+            if let Some(&hw_pair) = decoders.first().filter(|(d, _)| d.is_some()) {
+                decoders.insert(1, (hw_pair.0, "hardware (again, right away)"));
+            }
             for (d, name) in decoders {
                 match video::Decoder::untested(&clip, None, &info, (width, height), d).benchmark(0.0, frame_bytes, 150, 10.0) {
                     Ok(b) => {
