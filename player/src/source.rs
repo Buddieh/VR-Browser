@@ -35,10 +35,14 @@ pub fn resolve(input: &str, max_width: u32) -> Result<Source, String> {
     }
 
     // Prefer codecs the Frame decodes in hardware (VP9, H.264, HEVC) at a
-    // width the player handles, then anything that fits.
+    // width the player handles, then anything that fits. The hardware VP9
+    // decoder takes 4K at 30 fps but not at 60 (it stalls even on a
+    // downloaded clip), so high-resolution VP9 must be 30 fps or less, and
+    // faster video tops out at 1440p.
     let w = max_width;
     let format = format!(
-        "bv*[vcodec^=vp9][width<={w}]+ba/bv*[vcodec^=avc1][width<={w}]+ba/bv*[vcodec^=hev][width<={w}]+ba/\
+        "bv*[vcodec^=vp9][width<={w}][height>=1440][fps<=31]+ba/bv*[vcodec^=vp9][width<={w}][height<=1440]+ba/\
+         bv*[vcodec^=avc1][width<={w}]+ba/bv*[vcodec^=hev][width<={w}]+ba/\
          bv*[width<={w}]+ba/b[width<={w}]/b"
     );
     let ytdlp = bundled("yt-dlp").unwrap_or_else(|| PathBuf::from("yt-dlp"));

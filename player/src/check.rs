@@ -12,7 +12,7 @@ const DEFAULT_SOURCES: &[(&str, &str)] = &[
     ("YouTube 360 (cubemap, VP9 4K)", "https://www.youtube.com/watch?v=tR8ZtyhSDYw"),
     ("YouTube flat 4K 60 fps", "https://www.youtube.com/watch?v=LXb3EKWsInQ"),
     ("Internet Archive page", "https://archive.org/details/BigBuckBunny_124"),
-    ("Direct MP4 (H.264 1080p)", "https://download.blender.org/demo/movies/BBB/bbb_sunflower_1080p_30fps_normal.mp4"),
+    ("Direct MP4 (H.264 1080p)", "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/1080/Big_Buck_Bunny_1080_10s_30MB.mp4"),
     ("HLS stream (.m3u8)", "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"),
     ("DASH stream (.mpd)", "https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd"),
 ];
@@ -122,6 +122,10 @@ fn check_one(input: &str, max_width: u32, hw: bool) -> Result<Vec<String>, Strin
     // Playback needs the decoder comfortably faster than the video.
     let frame_bytes = width as usize * height as usize * 3 / 2;
     let need = info.fps.max(1.0);
+    let web = input.starts_with("http://") || input.starts_with("https://");
+    // The same decoder reading the stream the other way (with or without
+    // the read-ahead buffer), to see which one keeps up.
+    let other_way = (web && decoder.read_ahead()).then(|| decoder.with_input(&src.video, decoder.hw_name()));
     let rate = |label: &str, start: f64, problems: &mut Vec<String>| match {
         eprintln!("    decoding {label}...");
         decoder.benchmark(start, frame_bytes, 150, 10.0)
@@ -144,6 +148,18 @@ fn check_one(input: &str, max_width: u32, hw: bool) -> Result<Vec<String>, Strin
         }
         Err(e) => problems.push(format!("decoding {label} failed: {e}")),
     };
+    let rate = |label: &str, start: f64, problems: &mut Vec<String>| {
+        rate(label, start, problems);
+        if let Some(d) = &other_way {
+            match d.benchmark(start, frame_bytes, 150, 10.0) {
+                Ok(b) => eprintln!(
+                    "    same {label} without read-ahead: first frame after {:.2}s, then {:.0} fps ({} frames)",
+                    b.first_frame, b.fps, b.frames
+                ),
+                Err(e) => eprintln!("    same {label} without read-ahead: failed ({e})"),
+            }
+        }
+    };
     rate("from the start", 0.0, &mut problems);
     let seek_to = duration.filter(|d| *d > 30.0).map(|d| (d * 0.5).floor());
     if let Some(t) = seek_to {
@@ -156,7 +172,11 @@ fn check_one(input: &str, max_width: u32, hw: bool) -> Result<Vec<String>, Strin
     // decoder turning it into pictures. Download a short clip without
     // decoding (network speed), then decode that clip with each decoder
     // (decoder speed with the network out of the way).
-    if input.starts_with("http://") || input.starts_with("https://") {
+    if web {
+        let lower = src.video.to_ascii_lowercase();
+        if ![".m3u8", ".mpd", "manifest"].iter().any(|p| lower.contains(p)) {
+            connections(&src.video);
+        }
         let clip = std::env::temp_dir().join(format!("vr-player-check-{}.mkv", std::process::id()));
         let clip = clip.display().to_string();
         let mut positions = vec![("from the start".to_string(), 0.0)];
@@ -166,7 +186,12 @@ fn check_one(input: &str, max_width: u32, hw: bool) -> Result<Vec<String>, Strin
             match video::fetch_clip(&src.video, at, CLIP_SECS, &clip) {
                 Ok(took) => {
                     let speed = CLIP_SECS / took.max(1e-3);
-                    eprintln!("    network {label}: {CLIP_SECS:.0}s of video arrived in {took:.1}s ({speed:.1}x playback speed)");
+                    let mbit = std::fs::metadata(&clip).map_or(0.0, |m| m.len() as f64 * 8.0 / 1e6);
+                    eprintln!(
+                        "    network {label}: {CLIP_SECS:.0}s of video ({:.0} Mbit/s to play) arrived in {took:.1}s ({speed:.1}x playback speed, {:.0} Mbit/s)",
+                        mbit / CLIP_SECS,
+                        mbit / took.max(1e-3)
+                    );
                     if speed < 1.3 {
                         problems.push(format!(
                             "network {label}: {CLIP_SECS:.0}s of video took {took:.1}s to arrive, too slow to play smoothly"
@@ -227,4 +252,34 @@ fn check_one(input: &str, max_width: u32, hw: bool) -> Result<Vec<String>, Strin
         }
     }
     Ok(problems)
+}
+
+/// Download speed of `url` over one connection and over four at once: much
+/// faster with four means the site limits each connection, not the network.
+fn connections(url: &str) {
+    const CHUNK: u64 = 4 << 20;
+    let fetch = |from: u64, len: u64| {
+        std::process::Command::new("curl")
+            .args(["-s", "-o", "/dev/null", "-m", "20", "-w", "%{size_download}"])
+            .args(["-r", &format!("{from}-{}", from + len - 1), url])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    };
+    let bytes = |c: std::io::Result<std::process::Child>| -> f64 {
+        c.and_then(|c| c.wait_with_output())
+            .ok()
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+            .unwrap_or(0.0)
+    };
+    eprintln!("    timing downloads over one and over four connections...");
+    let t = Instant::now();
+    let one = bytes(fetch(0, 4 * CHUNK));
+    let one = one * 8.0 / 1e6 / t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    let children: Vec<_> = (0..4).map(|i| fetch((4 + i) * CHUNK, CHUNK)).collect();
+    let four: f64 = children.into_iter().map(bytes).sum();
+    let four = four * 8.0 / 1e6 / t.elapsed().as_secs_f64();
+    eprintln!("    downloads: one connection {one:.0} Mbit/s, four connections {four:.0} Mbit/s");
 }

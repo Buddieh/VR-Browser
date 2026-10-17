@@ -49,8 +49,9 @@ screen; YouTube's cube-shaped 360 format is recognised automatically. Every run 
 **Checking sources:** `~/.local/bin/vr-player --check` tries a built-in list of
 sites and formats (YouTube 360 and 4K, an Internet Archive page, direct MP4,
 HLS, DASH, the local samples) without the headset: it finds the streams, picks
-the decoder, decodes from the start and after a seek, downloads a short clip
-to time the network apart from the decoder, decodes that clip with each
+the decoder, decodes from the start and after a seek (with and without the
+read-ahead buffer), times downloads over one and four connections, downloads a
+short clip to time the network apart from the decoder, decodes that clip with each
 decoder, starts the sound, and prints what will play smoothly and what won't. Give it your own pages or files to test those
 instead: `vr-player --check URL ...`. The report goes to `~/vr-player.log`.
 

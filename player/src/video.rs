@@ -359,6 +359,16 @@ impl Decoder {
         self.decoder.is_some()
     }
 
+    /// Web stream read through ffmpeg's read-ahead buffer.
+    pub fn read_ahead(&self) -> bool {
+        self.video_url.starts_with("async:")
+    }
+
+    /// Hardware decoder in use, if any.
+    pub fn hw_name(&self) -> Option<&'static str> {
+        self.decoder
+    }
+
     /// The same decoding, but of another input (a downloaded clip) and with
     /// the given decoder (`None` = software).
     pub fn with_input(&self, input: &str, decoder: Option<&'static str>) -> Decoder {
