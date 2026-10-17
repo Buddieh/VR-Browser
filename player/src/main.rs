@@ -835,7 +835,6 @@ fn run(args: Args) -> Result<(), String> {
         let mut events = xr::EventDataBuffer::new();
         let mut running = false;
         let mut quitting = false;
-        let mut last_seq = 0;
         let mut have_frame = false;
         let mut texture_layout = vk::ImageLayout::UNDEFINED;
         let mut frames_uploaded: u64 = 0;
@@ -996,10 +995,13 @@ fn run(args: Args) -> Result<(), String> {
                 panel_shown = false;
             }
 
-            let new_frame = slots.take_latest(last_seq);
+            // The newest decoded frame whose time has come (the first one of a
+            // new playback at once, so a seek shows its picture straight away).
+            let due = playback.clock().unwrap_or(f64::NEG_INFINITY);
+            let new_frame = slots.take_due(due, playback.fresh());
             if !state.should_render || (!have_frame && new_frame.is_none()) {
-                if new_frame.is_some() {
-                    slots.release();
+                if let Some((slot, _)) = new_frame {
+                    slots.release(slot);
                 }
                 frame_stream.end(now, blend_mode, &[]).map_err(|e| e.to_string())?;
                 continue;
@@ -1016,8 +1018,8 @@ fn run(args: Args) -> Result<(), String> {
                 )
                 .map_err(vkerr)?;
 
-            if let Some((slot, seq)) = new_frame {
-                last_seq = seq;
+            if let Some((slot, pts)) = new_frame {
+                playback.showing(pts);
                 if check_cube && frames_uploaded % 15 == 0 {
                     match video::looks_like_eac(slots.slot(slot), width as usize, height as usize) {
                         Some(cube) => {
@@ -1037,7 +1039,11 @@ fn run(args: Args) -> Result<(), String> {
                 frames_uploaded += 1;
                 if frames_uploaded % 300 == 0 {
                     // Rate over the last 300 frames, so pauses and seeks don't skew it.
-                    eprintln!("video: {frames_uploaded} frames, {:.1} fps", 300.0 / started.elapsed().as_secs_f64());
+                    eprintln!(
+                        "video: {frames_uploaded} frames, {:.1} fps, {} dropped as late so far",
+                        300.0 / started.elapsed().as_secs_f64(),
+                        slots.skipped()
+                    );
                     started = Instant::now();
                 }
             }
@@ -1132,8 +1138,8 @@ fn run(args: Args) -> Result<(), String> {
                 .map_err(vkerr)?;
             device.wait_for_fences(&[fence], true, u64::MAX).map_err(vkerr)?;
             device.reset_fences(&[fence]).map_err(vkerr)?;
-            if new_frame.is_some() {
-                slots.release();
+            if let Some((slot, _)) = new_frame {
+                slots.release(slot);
             }
             swapchain.release_image().map_err(|e| e.to_string())?;
             if panel_acquired {

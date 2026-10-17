@@ -4,19 +4,20 @@
 //! the codec allows) and writes raw NV12 frames (the decoder's own layout:
 //! full-size luma, then half-size interleaved chroma) to a pipe; the shader
 //! turns them into colour. A
-//! reader thread paces those frames and writes each
-//! one straight into a GPU-visible staging buffer picked by `FrameSlots`.
-//! Audio is played by a separate `ffplay` process, and frames are held until
-//! ffplay's clock reaches them, so picture follows sound. Seeking restarts
+//! reader thread writes each one straight into a GPU-visible staging buffer
+//! from `FrameSlots`, decoding a few frames ahead; the renderer shows each
+//! when the playback clock reaches it.
+//! Audio is played by a separate `ffplay` process, and the playback clock
+//! follows ffplay's, so picture follows sound. Seeking restarts
 //! both processes at the new position; pausing freezes ffplay.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::Read,
     process::{Child, ChildStderr, Command, Stdio},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -97,9 +98,10 @@ pub fn output_size(info: &VideoInfo, max_width: u32) -> (u32, u32) {
     (max_width & !1, h & !1)
 }
 
-/// Ring of staging buffers shared between the reader thread and the renderer.
-/// The reader fills any slot that is neither the latest published frame nor
-/// the one the GPU is copying from.
+/// Staging buffers shared between the reader thread and the renderer. The
+/// reader decodes ahead into free slots and queues them with their time; the
+/// renderer takes, each display frame, the newest frame whose time has come,
+/// so frames change on a steady beat whatever the decoder's timing.
 pub struct FrameSlots {
     ptrs: Vec<usize>,
     pub frame_bytes: usize,
@@ -109,9 +111,11 @@ pub struct FrameSlots {
 
 #[derive(Default)]
 struct SlotState {
-    latest: Option<usize>,
-    seq: u64,
-    in_use: Option<usize>,
+    free: Vec<usize>,
+    /// Decoded frames in order: (slot, video time in seconds).
+    ready: VecDeque<(usize, f64)>,
+    /// Frames dropped because their time passed before they were shown.
+    skipped: u64,
 }
 
 impl FrameSlots {
@@ -119,58 +123,87 @@ impl FrameSlots {
     /// Each pointer must address `frame_bytes` of persistently mapped,
     /// host-coherent memory that outlives this struct.
     pub unsafe fn new(ptrs: Vec<*mut u8>, frame_bytes: usize) -> Self {
-        assert!(ptrs.len() >= 3);
+        assert!(ptrs.len() >= 2);
+        let state = SlotState { free: (0..ptrs.len()).collect(), ..Default::default() };
         Self {
             ptrs: ptrs.into_iter().map(|p| p as usize).collect(),
             frame_bytes,
-            state: Mutex::new(SlotState::default()),
+            state: Mutex::new(state),
             freed: Condvar::new(),
         }
     }
 
-    /// Renderer: take the newest frame if it is newer than `last_seq`.
-    pub fn take_latest(&self, last_seq: u64) -> Option<(usize, u64)> {
+    /// Renderer: the newest queued frame due at `time` (dropping older ones),
+    /// or with `first`, the next frame whatever its time.
+    pub fn take_due(&self, time: f64, first: bool) -> Option<(usize, f64)> {
         let mut s = self.state.lock().unwrap();
-        match s.latest {
-            Some(i) if s.seq != last_seq => {
-                s.in_use = Some(i);
-                Some((i, s.seq))
+        let mut chosen: Option<(usize, f64)> = None;
+        while let Some(&(i, pts)) = s.ready.front() {
+            if pts > time && !(first && chosen.is_none()) {
+                break;
             }
-            _ => None,
+            s.ready.pop_front();
+            if let Some((old, _)) = chosen.replace((i, pts)) {
+                s.free.push(old);
+                s.skipped += 1;
+            }
         }
+        drop(s);
+        self.freed.notify_all();
+        chosen
     }
 
-    /// Renderer: the GPU copy from the slot taken last has finished.
-    pub fn release(&self) {
-        self.state.lock().unwrap().in_use = None;
+    /// Renderer: done with a slot from `take_due` (its GPU copy has finished).
+    pub fn release(&self, i: usize) {
+        self.state.lock().unwrap().free.push(i);
         self.freed.notify_all();
     }
 
-    fn free_slot(&self) -> usize {
+    /// Frames dropped so far because they came too late.
+    pub fn skipped(&self) -> u64 {
+        self.state.lock().unwrap().skipped
+    }
+
+    /// No decoded frames waiting.
+    pub fn is_empty(&self) -> bool {
+        self.state.lock().unwrap().ready.is_empty()
+    }
+
+    /// Drop all queued frames (after the reader has stopped, before a seek).
+    fn clear(&self) {
         let mut s = self.state.lock().unwrap();
-        loop {
-            if let Some(i) = (0..self.ptrs.len()).find(|&i| Some(i) != s.latest && Some(i) != s.in_use) {
-                return i;
-            }
-            s = self.freed.wait(s).unwrap();
+        while let Some((i, _)) = s.ready.pop_front() {
+            s.free.push(i);
         }
     }
 
-    fn publish(&self, i: usize) {
+    /// Reader: wait for a free slot; `None` once `stop` is set.
+    fn free_slot(&self, stop: &AtomicBool) -> Option<usize> {
         let mut s = self.state.lock().unwrap();
-        s.latest = Some(i);
-        s.seq += 1;
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            if let Some(i) = s.free.pop() {
+                return Some(i);
+            }
+            s = self.freed.wait_timeout(s, Duration::from_millis(50)).unwrap().0;
+        }
     }
 
-    /// Renderer: read the slot returned by `take_latest` (until `release`).
+    fn queue(&self, i: usize, pts: f64) {
+        self.state.lock().unwrap().ready.push_back((i, pts));
+    }
+
+    /// Renderer: read a slot returned by `take_due` (until `release`).
     pub fn slot(&self, i: usize) -> &[u8] {
-        // SAFETY: guaranteed by `new`; the reader never writes the slot in use.
+        // SAFETY: guaranteed by `new`; the reader never writes a queued or taken slot.
         unsafe { std::slice::from_raw_parts(self.ptrs[i] as *const u8, self.frame_bytes) }
     }
 
     fn slot_mut(&self, i: usize) -> &mut [u8] {
         // SAFETY: guaranteed by `new`; the slot protocol gives the reader
-        // exclusive access to slot `i` until it is published.
+        // exclusive access to a free slot until it is queued.
         unsafe { std::slice::from_raw_parts_mut(self.ptrs[i] as *mut u8, self.frame_bytes) }
     }
 }
@@ -300,29 +333,21 @@ impl Decoder {
         };
 
         let shared = Arc::new(Shared::default());
-        shared.paused.store(paused, Ordering::Relaxed);
         let s = shared.clone();
         let fps = self.fps.clamp(1.0, 240.0);
+        let reader_slots = slots.clone();
         let reader = thread::spawn(move || {
+            let slots = reader_slots;
             let started = Instant::now();
-            // Frame clock (instant, video time) for when there is no sound to follow.
-            let mut anchor: Option<(Instant, f64)> = None;
             let mut n: u32 = 0;
             // Time spent waiting for ffmpeg, to tell decoding limits from pacing.
             let mut reading = Duration::ZERO;
-            while !s.stop.load(Ordering::Relaxed) {
-                let i = slots.free_slot();
+            while let Some(i) = slots.free_slot(&s.stop) {
                 let read_start = Instant::now();
                 let read = pipe.read_exact(slots.slot_mut(i));
                 reading += read_start.elapsed();
-                if n > 0 && n % 300 == 0 {
-                    eprintln!(
-                        "video: decoder delivers up to {:.1} fps (needs {fps:.1})",
-                        300.0 / reading.as_secs_f64().max(1e-3)
-                    );
-                    reading = Duration::ZERO;
-                }
                 if let Err(e) = read {
+                    slots.release(i);
                     if !s.stop.load(Ordering::Relaxed) {
                         eprintln!("video: decoder stream ended after {n} frames ({e})");
                         s.ended.store(true, Ordering::Relaxed);
@@ -332,47 +357,31 @@ impl Decoder {
                 if n == 0 {
                     eprintln!("video: first frame decoded after {:.2}s", started.elapsed().as_secs_f64());
                 }
-                // Hold the frame until the sound reaches it. Without sound (or
-                // before it starts, for a while) follow the frame rate instead.
-                let pts = start_secs + n as f64 / fps;
-                while !s.stop.load(Ordering::Relaxed) && !s.paused.load(Ordering::Relaxed) {
-                    let heard = clock.as_ref().filter(|c| !c.gone()).map(|c| c.now());
-                    let wait = match heard {
-                        Some(Some(t)) => {
-                            anchor = None;
-                            if t - pts > 0.5 && n % 60 == 0 {
-                                eprintln!("video: {:.0} ms behind the sound", (t - pts) * 1e3);
-                            }
-                            pts - t
-                        }
-                        Some(None) if started.elapsed() < Duration::from_secs(3) => 0.005,
-                        _ => {
-                            if anchor.is_none() && clock.is_some() && n < 2 {
-                                eprintln!("audio: no clock from ffplay yet; following the frame rate");
-                            }
-                            let (at, from) = *anchor.get_or_insert((Instant::now(), pts));
-                            pts - from - at.elapsed().as_secs_f64()
-                        }
-                    };
-                    if wait <= 0.002 {
-                        break;
-                    }
-                    thread::sleep(Duration::from_secs_f64(wait.min(0.01)));
-                }
-                slots.publish(i);
+                slots.queue(i, start_secs + n as f64 / fps);
                 n += 1;
-                s.frames.store(n as u64, Ordering::Relaxed);
-                // While paused, hold the next frame back; the frame clock restarts after.
-                if s.paused.load(Ordering::Relaxed) {
-                    while s.paused.load(Ordering::Relaxed) && !s.stop.load(Ordering::Relaxed) {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    anchor = None;
+                if n % 300 == 0 {
+                    eprintln!(
+                        "video: decoder delivers up to {:.1} fps (needs {fps:.1})",
+                        300.0 / reading.as_secs_f64().max(1e-3)
+                    );
+                    reading = Duration::ZERO;
                 }
             }
         });
 
-        let p = Playback { video, audio, shared, reader: Some(reader), start_secs, fps: self.fps };
+        let p = Playback {
+            video,
+            audio,
+            clock,
+            shared,
+            slots,
+            reader: Some(reader),
+            started: Instant::now(),
+            anchor: None,
+            shown: None,
+            paused_at: paused.then_some(start_secs),
+            start_secs,
+        };
         if paused {
             p.signal_audio("-STOP");
         }
@@ -446,40 +455,93 @@ impl AudioClock {
 #[derive(Default)]
 struct Shared {
     stop: AtomicBool,
-    paused: AtomicBool,
     ended: AtomicBool,
-    frames: AtomicU64,
 }
 
 pub struct Playback {
     video: Child,
     audio: Option<Child>,
+    clock: Option<Arc<AudioClock>>,
     shared: Arc<Shared>,
+    slots: Arc<FrameSlots>,
     reader: Option<thread::JoinHandle<()>>,
+    started: Instant,
+    /// Playback clock: video time `.1` at instant `.0`, kept close to the sound.
+    anchor: Option<(Instant, f64)>,
+    /// Time of the frame on screen.
+    shown: Option<f64>,
+    /// Video time while paused.
+    paused_at: Option<f64>,
     start_secs: f64,
-    fps: f64,
 }
 
 impl Playback {
+    /// Video time the picture should show now: follows the sound when there
+    /// is any, else the wall clock from the first frame. `None` before
+    /// playback has started (the first frame is still shown at once).
+    pub fn clock(&mut self) -> Option<f64> {
+        if let Some(t) = self.paused_at {
+            return Some(t);
+        }
+        let heard = self.clock.as_ref().filter(|c| !c.gone()).and_then(|c| c.now());
+        if let Some((at, t)) = self.anchor.as_mut() {
+            if let Some(h) = heard {
+                // Steer smoothly towards the sound; jump only when far off.
+                let err = h - (*t + at.elapsed().as_secs_f64());
+                if err.abs() > 0.15 {
+                    *at = Instant::now();
+                    *t = h;
+                } else {
+                    *t += err * 0.05;
+                }
+            }
+        } else if let Some(h) = heard {
+            self.anchor = Some((Instant::now(), h));
+        } else if let Some(t) = self.shown
+            && (self.clock.is_none() || self.started.elapsed() > Duration::from_secs(3))
+        {
+            if self.clock.is_some() {
+                eprintln!("audio: no clock from ffplay; following the frame rate");
+            }
+            self.anchor = Some((Instant::now(), t));
+        }
+        self.anchor.map(|(at, t)| t + at.elapsed().as_secs_f64())
+    }
+
+    /// Renderer: a frame with time `t` is now on screen.
+    pub fn showing(&mut self, t: f64) {
+        self.shown = Some(t);
+    }
+
     /// Seconds into the video of the frame on screen.
     pub fn position(&self) -> f64 {
-        let n = self.shared.frames.load(Ordering::Relaxed).saturating_sub(1);
-        self.start_secs + n as f64 / self.fps.max(1.0)
+        self.shown.unwrap_or(self.start_secs)
+    }
+
+    /// No frame of this playback shown yet.
+    pub fn fresh(&self) -> bool {
+        self.shown.is_none()
     }
 
     pub fn ended(&self) -> bool {
-        self.shared.ended.load(Ordering::Relaxed)
+        self.shared.ended.load(Ordering::Relaxed) && self.slots.is_empty()
     }
 
     pub fn paused(&self) -> bool {
-        self.shared.paused.load(Ordering::Relaxed)
+        self.paused_at.is_some()
     }
 
     pub fn set_paused(&mut self, paused: bool) {
-        if self.paused() != paused {
-            self.shared.paused.store(paused, Ordering::Relaxed);
-            self.signal_audio(if paused { "-STOP" } else { "-CONT" });
+        if self.paused() == paused {
+            return;
         }
+        if paused {
+            self.paused_at = Some(self.clock().unwrap_or(self.position()));
+        } else {
+            // Restart the clock where it stopped; the sound picks up there too.
+            self.anchor = self.paused_at.take().map(|t| (Instant::now(), t));
+        }
+        self.signal_audio(if paused { "-STOP" } else { "-CONT" });
     }
 
     /// Freeze or continue the audio player (ffplay has no pause command on a pipe).
@@ -489,7 +551,7 @@ impl Playback {
         }
     }
 
-    /// Stop decoding and sound; safe to call more than once.
+    /// Stop decoding and sound, and drop queued frames; safe to call more than once.
     pub fn stop(&mut self) {
         self.shared.stop.store(true, Ordering::Relaxed);
         let _ = self.video.kill();
@@ -499,8 +561,11 @@ impl Playback {
             let _ = a.kill();
             let _ = a.wait();
         }
+        // Only the first call clears: by a second one (when a replaced
+        // playback is dropped) the slots may hold the new playback's frames.
         if let Some(r) = self.reader.take() {
             let _ = r.join();
+            self.slots.clear();
         }
     }
 }
