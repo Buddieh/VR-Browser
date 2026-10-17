@@ -83,3 +83,20 @@ ffmpeg (H.264, H.265, VP9); the system GStreamer has no usable decoders.
    with one command; the app checks GitHub Releases for updates.
 4. **Playback hardening:** codec checks (H.264/HEVC/AV1), quick layout
    switching, per-site settings.
+
+## How it works
+
+The player is a native OpenXR app (Rust, Vulkan) running on SteamVR. It
+decodes video with the system ffmpeg on the Frame's hardware decoder, plays
+sound through ffplay and keeps the picture in step with the audio clock, and
+uses yt-dlp to find the video on web pages. The full list of protocols,
+formats and outside tools is in [docs/architecture.md](docs/architecture.md).
+
+## Credits
+
+Designed and written by **Claude**, an AI model made by
+[Anthropic](https://www.anthropic.com), through
+[Claude Code](https://claude.com/claude-code), with direction and on-device
+testing by [@Buddieh](https://github.com/Buddieh). Built on OpenXR, Vulkan,
+FFmpeg, yt-dlp and other open-source projects listed in
+[docs/architecture.md](docs/architecture.md#credits).
