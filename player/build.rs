@@ -3,7 +3,7 @@ use std::{env, path::PathBuf, process::Command};
 
 fn main() {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
-    for name in ["fullscreen.vert", "video.frag"] {
+    for name in ["fullscreen.vert", "video.frag", "convert.frag"] {
         let src = format!("shaders/{name}");
         println!("cargo:rerun-if-changed={src}");
         let status = Command::new("glslangValidator")

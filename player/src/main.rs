@@ -598,14 +598,12 @@ fn run(args: Args) -> Result<(), String> {
         );
         let panel = ui::Panel::new(color_format == vk::Format::B8G8R8A8_SRGB);
 
-        // --- Video textures: two sets (the frame on screen and the next one, for
-        // blending), each a full-size luma (R8) and half-size chroma (R8G8) plane.
-        let mut planes = Vec::new();
-        for (format, w, h) in [(vk::Format::R8_UNORM, width, height), (vk::Format::R8G8_UNORM, width / 2, height / 2)]
-            .into_iter()
-            .cycle()
-            .take(4)
-        {
+        // --- Video textures -----------------------------------------------------------
+        // Each decoded frame is copied into a luma (R8) and a half-size chroma
+        // (R8G8) texture and turned into colour once, into one of two sRGB
+        // pictures: the frame on screen and the next one (for blending). The eye
+        // views only sample those, so the colour maths isn't redone every refresh.
+        let make_texture = |format: vk::Format, w: u32, h: u32, usage: vk::ImageUsageFlags| -> Result<Plane, String> {
             let image = device
                 .create_image(
                     &vk::ImageCreateInfo::default()
@@ -616,7 +614,7 @@ fn run(args: Args) -> Result<(), String> {
                         .array_layers(1)
                         .samples(vk::SampleCountFlags::TYPE_1)
                         .tiling(vk::ImageTiling::OPTIMAL)
-                        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+                        .usage(usage | vk::ImageUsageFlags::SAMPLED)
                         .initial_layout(vk::ImageLayout::UNDEFINED),
                     None,
                 )
@@ -648,26 +646,100 @@ fn run(args: Args) -> Result<(), String> {
                     None,
                 )
                 .map_err(vkerr)?;
-            planes.push(Plane { image, memory, view, width: w, height: h });
-        }
+            Ok(Plane { image, memory, view, width: w, height: h })
+        };
+        let planes = [
+            make_texture(vk::Format::R8_UNORM, width, height, vk::ImageUsageFlags::TRANSFER_DST)?,
+            make_texture(vk::Format::R8G8_UNORM, width / 2, height / 2, vk::ImageUsageFlags::TRANSFER_DST)?,
+        ];
+        let picture_format = vk::Format::R8G8B8A8_SRGB;
+        let pictures = [
+            make_texture(picture_format, width, height, vk::ImageUsageFlags::COLOR_ATTACHMENT)?,
+            make_texture(picture_format, width, height, vk::ImageUsageFlags::COLOR_ATTACHMENT)?,
+        ];
         // Chroma starts right after the luma bytes in each decoded frame.
         let chroma_offset = width as u64 * height as u64;
-        let sampler = device
-            .create_sampler(
-                &vk::SamplerCreateInfo::default()
-                    .mag_filter(vk::Filter::LINEAR)
-                    .min_filter(vk::Filter::LINEAR)
-                    .address_mode_u(vk::SamplerAddressMode::REPEAT) // 360 video wraps around horizontally
-                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+        let make_sampler = |u: vk::SamplerAddressMode| {
+            device
+                .create_sampler(
+                    &vk::SamplerCreateInfo::default()
+                        .mag_filter(vk::Filter::LINEAR)
+                        .min_filter(vk::Filter::LINEAR)
+                        .address_mode_u(u)
+                        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                    None,
+                )
+                .map_err(vkerr)
+        };
+        // 360 video wraps around horizontally.
+        let sampler = make_sampler(vk::SamplerAddressMode::REPEAT)?;
+        let convert_sampler = make_sampler(vk::SamplerAddressMode::CLAMP_TO_EDGE)?;
+
+        // Render pass that writes a picture, leaving it ready to sample.
+        let convert_pass = device
+            .create_render_pass(
+                &vk::RenderPassCreateInfo::default()
+                    .attachments(&[vk::AttachmentDescription {
+                        format: picture_format,
+                        samples: vk::SampleCountFlags::TYPE_1,
+                        load_op: vk::AttachmentLoadOp::DONT_CARE,
+                        store_op: vk::AttachmentStoreOp::STORE,
+                        initial_layout: vk::ImageLayout::UNDEFINED,
+                        final_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        ..Default::default()
+                    }])
+                    .subpasses(&[vk::SubpassDescription::default()
+                        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+                        .color_attachments(&[vk::AttachmentReference {
+                            attachment: 0,
+                            layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                        }])])
+                    .dependencies(&[
+                        vk::SubpassDependency {
+                            src_subpass: vk::SUBPASS_EXTERNAL,
+                            dst_subpass: 0,
+                            src_stage_mask: vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                            dst_stage_mask: vk::PipelineStageFlags::FRAGMENT_SHADER
+                                | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                            src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
+                            dst_access_mask: vk::AccessFlags::SHADER_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                            ..Default::default()
+                        },
+                        vk::SubpassDependency {
+                            src_subpass: 0,
+                            dst_subpass: vk::SUBPASS_EXTERNAL,
+                            src_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                            dst_stage_mask: vk::PipelineStageFlags::FRAGMENT_SHADER,
+                            src_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                            dst_access_mask: vk::AccessFlags::SHADER_READ,
+                            ..Default::default()
+                        },
+                    ]),
                 None,
             )
             .map_err(vkerr)?;
+        let mut picture_framebuffers = [vk::Framebuffer::null(); 2];
+        for (fb, picture) in picture_framebuffers.iter_mut().zip(&pictures) {
+            *fb = device
+                .create_framebuffer(
+                    &vk::FramebufferCreateInfo::default()
+                        .render_pass(convert_pass)
+                        .attachments(&[picture.view])
+                        .width(width)
+                        .height(height)
+                        .layers(1),
+                    None,
+                )
+                .map_err(vkerr)?;
+        }
 
-        // --- Pipeline ---------------------------------------------------------------
+        // --- Pipelines ----------------------------------------------------------------
+        // Both read two textures: the eye views (picture on screen, next picture),
+        // and the colour conversion (luma, chroma).
         let set_layout = device
             .create_descriptor_set_layout(
-                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&[0, 1, 2, 3].map(|binding| {
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&[0, 1].map(|binding| {
                     vk::DescriptorSetLayoutBinding::default()
                         .binding(binding)
                         .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -677,52 +749,61 @@ fn run(args: Args) -> Result<(), String> {
                 None,
             )
             .map_err(vkerr)?;
-        let pipeline_layout = device
-            .create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default()
-                    .set_layouts(&[set_layout])
-                    .push_constant_ranges(&[vk::PushConstantRange {
-                        stage_flags: vk::ShaderStageFlags::FRAGMENT,
-                        offset: 0,
-                        size: size_of::<EyeConstants>() as u32,
-                    }]),
-                None,
-            )
-            .map_err(vkerr)?;
+        let make_layout = |push_bytes: usize| {
+            device
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default().set_layouts(&[set_layout]).push_constant_ranges(&[
+                        vk::PushConstantRange {
+                            stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                            offset: 0,
+                            size: push_bytes as u32,
+                        },
+                    ]),
+                    None,
+                )
+                .map_err(vkerr)
+        };
+        let pipeline_layout = make_layout(size_of::<EyeConstants>())?;
+        let convert_layout = make_layout(size_of::<[f32; 4]>())?;
         let descriptor_pool = device
             .create_descriptor_pool(
-                &vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&[vk::DescriptorPoolSize {
+                &vk::DescriptorPoolCreateInfo::default().max_sets(3).pool_sizes(&[vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                    descriptor_count: 4,
+                    descriptor_count: 6,
                 }]),
                 None,
             )
             .map_err(vkerr)?;
-        let descriptor_set = device
+        let sets = device
             .allocate_descriptor_sets(
-                &vk::DescriptorSetAllocateInfo::default().descriptor_pool(descriptor_pool).set_layouts(&[set_layout]),
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(descriptor_pool)
+                    .set_layouts(&[set_layout; 3]),
             )
-            .map_err(vkerr)?[0];
-        let image_infos = planes.iter().map(|p| {
-            [vk::DescriptorImageInfo {
-                sampler,
-                image_view: p.view,
-                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            }]
-        });
-        let image_infos: Vec<_> = image_infos.collect();
-        let writes: Vec<_> = image_infos
-            .iter()
-            .enumerate()
-            .map(|(binding, info)| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(descriptor_set)
-                    .dst_binding(binding as u32)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(info)
-            })
-            .collect();
-        device.update_descriptor_sets(&writes, &[]);
+            .map_err(vkerr)?;
+        // Eye views with picture k on screen use set k: (picture k, the other picture).
+        let eye_sets = [sets[0], sets[1]];
+        let convert_set = sets[2];
+        let bind = |set: vk::DescriptorSet, views: [vk::ImageView; 2], sampler: vk::Sampler| {
+            let infos = views.map(|image_view| {
+                [vk::DescriptorImageInfo { sampler, image_view, image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL }]
+            });
+            let writes: Vec<_> = infos
+                .iter()
+                .enumerate()
+                .map(|(binding, info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(binding as u32)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(info)
+                })
+                .collect();
+            device.update_descriptor_sets(&writes, &[]);
+        };
+        bind(eye_sets[0], [pictures[0].view, pictures[1].view], sampler);
+        bind(eye_sets[1], [pictures[1].view, pictures[0].view], sampler);
+        bind(convert_set, [planes[0].view, planes[1].view], convert_sampler);
 
         let shader = |bytes: &[u8]| {
             let code = ash::util::read_spv(&mut Cursor::new(bytes)).map_err(|e| e.to_string())?;
@@ -732,57 +813,64 @@ fn run(args: Args) -> Result<(), String> {
         };
         let vert = shader(include_bytes!(concat!(env!("OUT_DIR"), "/fullscreen.vert.spv")))?;
         let frag = shader(include_bytes!(concat!(env!("OUT_DIR"), "/video.frag.spv")))?;
+        let convert_frag = shader(include_bytes!(concat!(env!("OUT_DIR"), "/convert.frag.spv")))?;
         let main_name = CStr::from_bytes_with_nul(b"main\0").unwrap();
-        let pipeline = device
-            .create_graphics_pipelines(
-                vk::PipelineCache::null(),
-                &[vk::GraphicsPipelineCreateInfo::default()
-                    .stages(&[
-                        vk::PipelineShaderStageCreateInfo::default()
-                            .stage(vk::ShaderStageFlags::VERTEX)
-                            .module(vert)
-                            .name(main_name),
-                        vk::PipelineShaderStageCreateInfo::default()
-                            .stage(vk::ShaderStageFlags::FRAGMENT)
-                            .module(frag)
-                            .name(main_name),
-                    ])
-                    .vertex_input_state(&vk::PipelineVertexInputStateCreateInfo::default())
-                    .input_assembly_state(
-                        &vk::PipelineInputAssemblyStateCreateInfo::default()
-                            .topology(vk::PrimitiveTopology::TRIANGLE_LIST),
-                    )
-                    .viewport_state(
-                        &vk::PipelineViewportStateCreateInfo::default().scissor_count(1).viewport_count(1),
-                    )
-                    .rasterization_state(
-                        &vk::PipelineRasterizationStateCreateInfo::default()
-                            .cull_mode(vk::CullModeFlags::NONE)
-                            .polygon_mode(vk::PolygonMode::FILL)
-                            .line_width(1.0),
-                    )
-                    .multisample_state(
-                        &vk::PipelineMultisampleStateCreateInfo::default()
-                            .rasterization_samples(vk::SampleCountFlags::TYPE_1),
-                    )
-                    .color_blend_state(&vk::PipelineColorBlendStateCreateInfo::default().attachments(&[
-                        vk::PipelineColorBlendAttachmentState {
-                            color_write_mask: vk::ColorComponentFlags::RGBA,
-                            ..Default::default()
-                        },
-                    ]))
-                    .dynamic_state(
-                        &vk::PipelineDynamicStateCreateInfo::default()
-                            .dynamic_states(&[vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR]),
-                    )
-                    .layout(pipeline_layout)
-                    .render_pass(render_pass)
-                    .subpass(0)],
-                None,
-            )
-            .map_err(|(_, e)| e.to_string())?[0];
+        let make_pipeline = |frag: vk::ShaderModule, layout: vk::PipelineLayout, pass: vk::RenderPass| {
+            device
+                .create_graphics_pipelines(
+                    vk::PipelineCache::null(),
+                    &[vk::GraphicsPipelineCreateInfo::default()
+                        .stages(&[
+                            vk::PipelineShaderStageCreateInfo::default()
+                                .stage(vk::ShaderStageFlags::VERTEX)
+                                .module(vert)
+                                .name(main_name),
+                            vk::PipelineShaderStageCreateInfo::default()
+                                .stage(vk::ShaderStageFlags::FRAGMENT)
+                                .module(frag)
+                                .name(main_name),
+                        ])
+                        .vertex_input_state(&vk::PipelineVertexInputStateCreateInfo::default())
+                        .input_assembly_state(
+                            &vk::PipelineInputAssemblyStateCreateInfo::default()
+                                .topology(vk::PrimitiveTopology::TRIANGLE_LIST),
+                        )
+                        .viewport_state(
+                            &vk::PipelineViewportStateCreateInfo::default().scissor_count(1).viewport_count(1),
+                        )
+                        .rasterization_state(
+                            &vk::PipelineRasterizationStateCreateInfo::default()
+                                .cull_mode(vk::CullModeFlags::NONE)
+                                .polygon_mode(vk::PolygonMode::FILL)
+                                .line_width(1.0),
+                        )
+                        .multisample_state(
+                            &vk::PipelineMultisampleStateCreateInfo::default()
+                                .rasterization_samples(vk::SampleCountFlags::TYPE_1),
+                        )
+                        .color_blend_state(&vk::PipelineColorBlendStateCreateInfo::default().attachments(&[
+                            vk::PipelineColorBlendAttachmentState {
+                                color_write_mask: vk::ColorComponentFlags::RGBA,
+                                ..Default::default()
+                            },
+                        ]))
+                        .dynamic_state(
+                            &vk::PipelineDynamicStateCreateInfo::default()
+                                .dynamic_states(&[vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR]),
+                        )
+                        .layout(layout)
+                        .render_pass(pass)
+                        .subpass(0)],
+                    None,
+                )
+                .map(|p| p[0])
+                .map_err(|(_, e)| e.to_string())
+        };
+        let pipeline = make_pipeline(frag, pipeline_layout, render_pass)?;
+        let convert_pipeline = make_pipeline(convert_frag, convert_layout, convert_pass)?;
         device.destroy_shader_module(vert, None);
         device.destroy_shader_module(frag, None);
+        device.destroy_shader_module(convert_frag, None);
 
         // --- Staging buffers the decoder writes into ----------------------------------
         // NV12: luma plus quarter-size chroma with two bytes per sample.
@@ -833,12 +921,57 @@ fn run(args: Args) -> Result<(), String> {
             )
             .map_err(vkerr)?[0];
         let fence = device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(vkerr)?;
+        // GPU time per frame, for the log (when the queue supports timestamps).
+        let timestamp_ms = vk_instance.get_physical_device_properties(phys).limits.timestamp_period as f64 / 1e6;
+        let timestamps = vk_instance.get_physical_device_queue_family_properties(phys)[queue_family as usize]
+            .timestamp_valid_bits
+            > 0;
+        let query_pool = device
+            .create_query_pool(
+                &vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(2),
+                None,
+            )
+            .map_err(vkerr)?;
 
         let decoder = video::Decoder::new(&src.video, audio.as_deref(), &info, (width, height), args.hw)?;
         eprintln!("video: decoding with {}", if decoder.is_hw() { "hardware (iris)" } else { "software" });
         let mut playback = decoder.start(args.start, slots.clone(), false)?;
         let duration = info.duration;
         let title = if src.title.is_empty() { args.input.clone() } else { src.title.clone() };
+
+        // Record: decoded frame in staging slot `slot` -> picture `k`.
+        let colour = [info.bt601 as u32 as f32, info.full_range as u32 as f32, 0.0, 0.0];
+        let make_picture = |slot: usize, k: usize| {
+            upload_frame(&device, cmd, stages[slot].0, &planes, chroma_offset);
+            let area = vk::Rect2D { offset: vk::Offset2D::default(), extent: vk::Extent2D { width, height } };
+            device.cmd_begin_render_pass(
+                cmd,
+                &vk::RenderPassBeginInfo::default()
+                    .render_pass(convert_pass)
+                    .framebuffer(picture_framebuffers[k])
+                    .render_area(area),
+                vk::SubpassContents::INLINE,
+            );
+            device.cmd_set_viewport(
+                cmd,
+                0,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: width as f32,
+                    height: height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            device.cmd_set_scissor(cmd, 0, &[area]);
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, convert_pipeline);
+            device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, convert_layout, 0, &[convert_set], &[]);
+            let bytes = std::slice::from_raw_parts(colour.as_ptr() as *const u8, size_of_val(&colour));
+            device.cmd_push_constants(cmd, convert_layout, vk::ShaderStageFlags::FRAGMENT, 0, bytes);
+            device.cmd_draw(cmd, 3, 1, 0, 0);
+            device.cmd_end_render_pass(cmd);
+        };
 
         // --- Main loop -------------------------------------------------------------
         let mut events = xr::EventDataBuffer::new();
@@ -1071,6 +1204,10 @@ fn run(args: Args) -> Result<(), String> {
                     &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
                 )
                 .map_err(vkerr)?;
+            if timestamps {
+                device.cmd_reset_query_pool(cmd, query_pool, 0, 2);
+                device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, query_pool, 0);
+            }
 
             if new_frame.is_some() {
                 // How long the previous frame stayed up (not across seeks).
@@ -1106,7 +1243,7 @@ fn run(args: Args) -> Result<(), String> {
                     a_set = k;
                 } else {
                     a_set = 1 - a_set;
-                    upload_frame(&device, cmd, stages[slot].0, &planes[a_set * 2..a_set * 2 + 2], chroma_offset);
+                    make_picture(slot, a_set);
                     set_pts[a_set] = Some(pts);
                 }
                 have_frame = true;
@@ -1131,7 +1268,7 @@ fn run(args: Args) -> Result<(), String> {
                 if w > 0.0 {
                     let b = 1 - a_set;
                     if set_pts[b] != Some(next_pts) {
-                        upload_frame(&device, cmd, stages[next_slot].0, &planes[b * 2..b * 2 + 2], chroma_offset);
+                        make_picture(next_slot, b);
                         set_pts[b] = Some(next_pts);
                     }
                     weight = w as f32;
@@ -1188,7 +1325,7 @@ fn run(args: Args) -> Result<(), String> {
                     pos: [pos.x, pos.y, pos.z, 0.0],
                     rect: eye_rect(stereo, eye),
                     params: [mode, args.screen_m, args.screen_m / video_aspect, args.screen_m],
-                    color: [info.bt601 as u32 as f32, info.full_range as u32 as f32, weight, a_set as f32],
+                    color: [weight, 0.0, 0.0, 0.0],
                 };
                 device.cmd_begin_render_pass(
                     cmd,
@@ -1217,12 +1354,15 @@ fn run(args: Args) -> Result<(), String> {
                     vk::PipelineBindPoint::GRAPHICS,
                     pipeline_layout,
                     0,
-                    &[descriptor_set],
+                    &[eye_sets[a_set]],
                     &[],
                 );
                 device.cmd_push_constants(cmd, pipeline_layout, vk::ShaderStageFlags::FRAGMENT, 0, c.bytes());
                 device.cmd_draw(cmd, 3, 1, 0, 0);
                 device.cmd_end_render_pass(cmd);
+            }
+            if timestamps {
+                device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, query_pool, 1);
             }
             device.end_command_buffer(cmd).map_err(vkerr)?;
             device
@@ -1230,6 +1370,14 @@ fn run(args: Args) -> Result<(), String> {
                 .map_err(vkerr)?;
             device.wait_for_fences(&[fence], true, u64::MAX).map_err(vkerr)?;
             device.reset_fences(&[fence]).map_err(vkerr)?;
+            let mut stamps = [0u64; 2];
+            if timestamps
+                && device
+                    .get_query_pool_results(query_pool, 0, &mut stamps, vk::QueryResultFlags::TYPE_64)
+                    .is_ok()
+            {
+                timing.gpu.push((stamps[1].wrapping_sub(stamps[0]) as f64 * timestamp_ms) as f32);
+            }
             if let Some((slot, _)) = new_frame {
                 slots.release(slot);
             }
@@ -1294,11 +1442,19 @@ fn run(args: Args) -> Result<(), String> {
             device.destroy_image_view(v, None);
         }
         device.destroy_pipeline(pipeline, None);
+        device.destroy_pipeline(convert_pipeline, None);
         device.destroy_pipeline_layout(pipeline_layout, None);
+        device.destroy_pipeline_layout(convert_layout, None);
+        for fb in picture_framebuffers {
+            device.destroy_framebuffer(fb, None);
+        }
+        device.destroy_render_pass(convert_pass, None);
+        device.destroy_query_pool(query_pool, None);
         device.destroy_descriptor_pool(descriptor_pool, None);
         device.destroy_descriptor_set_layout(set_layout, None);
         device.destroy_sampler(sampler, None);
-        for p in planes {
+        device.destroy_sampler(convert_sampler, None);
+        for p in planes.into_iter().chain(pictures) {
             device.destroy_image_view(p.view, None);
             device.destroy_image(p.image, None);
             device.free_memory(p.memory, None);
@@ -1479,6 +1635,8 @@ struct Timing {
     missed: u32,
     /// Milliseconds from the frame wait returning to the frame submitted.
     work: Vec<f32>,
+    /// Milliseconds the GPU spent on each frame's commands.
+    gpu: Vec<f32>,
     /// How many video frames stayed on screen for 1, 2, 3, 4, 5+ refreshes.
     holds: [u32; 5],
     /// Refreshes that blended two video frames.
@@ -1487,17 +1645,20 @@ struct Timing {
 
 impl Timing {
     fn report(&mut self, period_ms: f64) {
-        self.work.sort_by(f32::total_cmp);
-        let n = self.work.len().max(1);
-        let pct = |p: usize| self.work.get((n * p / 100).min(n - 1)).copied().unwrap_or(0.0);
+        // (median, 99th percentile, slowest) in milliseconds.
+        let spread = |v: &mut Vec<f32>| {
+            v.sort_by(f32::total_cmp);
+            let n = v.len().max(1);
+            let at = |p: usize| v.get((n * p / 100).min(n - 1)).copied().unwrap_or(0.0);
+            (at(50), at(99), v.last().copied().unwrap_or(0.0))
+        };
+        let (w50, w99, wmax) = spread(&mut self.work);
+        let (g50, g99, gmax) = spread(&mut self.gpu);
         eprintln!(
-            "render: {} display frames at {period_ms:.1} ms, {} missed; work per frame: median {:.1} ms, \
-             99% under {:.1} ms, slowest {:.1} ms",
-            self.frames,
-            self.missed,
-            pct(50),
-            pct(99),
-            self.work.last().copied().unwrap_or(0.0),
+            "render: {} display frames at {period_ms:.1} ms, {} missed; work per frame: median {w50:.1} ms, \
+             99% under {w99:.1} ms, slowest {wmax:.1} ms; GPU: median {g50:.1} ms, 99% under {g99:.1} ms, \
+             slowest {gmax:.1} ms",
+            self.frames, self.missed,
         );
         let [h1, h2, h3, h4, h5] = self.holds;
         eprintln!(
@@ -1507,7 +1668,7 @@ impl Timing {
     }
 }
 
-/// One plane of the video texture pair.
+/// A video texture: a luma or chroma plane, or a picture in colour.
 struct Plane {
     image: vk::Image,
     memory: vk::DeviceMemory,
