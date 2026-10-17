@@ -11,11 +11,14 @@ use crate::{Projection, Stereo, source, video};
 const DEFAULT_SOURCES: &[(&str, &str)] = &[
     ("YouTube 360 (cubemap, VP9 4K)", "https://www.youtube.com/watch?v=tR8ZtyhSDYw"),
     ("YouTube flat 4K 60 fps", "https://www.youtube.com/watch?v=LXb3EKWsInQ"),
-    ("Vimeo", "https://vimeo.com/76979871"),
-    ("Direct MP4 (H.264 1080p)", "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"),
+    ("Internet Archive page", "https://archive.org/details/BigBuckBunny_124"),
+    ("Direct MP4 (H.264 1080p)", "https://download.blender.org/demo/movies/BBB/bbb_sunflower_1080p_30fps_normal.mp4"),
     ("HLS stream (.m3u8)", "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"),
     ("DASH stream (.mpd)", "https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd"),
 ];
+
+/// Seconds of video downloaded to test the network apart from the decoder.
+const CLIP_SECS: f64 = 10.0;
 
 /// Local samples the installer downloads, tried too when present.
 const LOCAL_SAMPLES: &[(&str, &str)] =
@@ -149,21 +152,74 @@ fn check_one(input: &str, max_width: u32, hw: bool) -> Result<Vec<String>, Strin
         eprintln!("    seek: skipped (live or shorter than 30s)");
     }
 
+    // Playback mixes two things: the network delivering the stream, and the
+    // decoder turning it into pictures. Download a short clip without
+    // decoding (network speed), then decode that clip with each decoder
+    // (decoder speed with the network out of the way).
+    if input.starts_with("http://") || input.starts_with("https://") {
+        let clip = std::env::temp_dir().join(format!("vr-player-check-{}.mkv", std::process::id()));
+        let clip = clip.display().to_string();
+        let mut positions = vec![("from the start".to_string(), 0.0)];
+        positions.extend(seek_to.map(|t| (format!("at {t:.0}s"), t)));
+        for (label, at) in positions {
+            eprintln!("    downloading {CLIP_SECS:.0}s of video {label} without decoding...");
+            match video::fetch_clip(&src.video, at, CLIP_SECS, &clip) {
+                Ok(took) => {
+                    let speed = CLIP_SECS / took.max(1e-3);
+                    eprintln!("    network {label}: {CLIP_SECS:.0}s of video arrived in {took:.1}s ({speed:.1}x playback speed)");
+                    if speed < 1.3 {
+                        problems.push(format!(
+                            "network {label}: {CLIP_SECS:.0}s of video took {took:.1}s to arrive, too slow to play smoothly"
+                        ));
+                    }
+                }
+                Err(e) => {
+                    problems.push(format!("network {label}: download failed: {e}"));
+                    continue;
+                }
+            }
+            let mut decoders = vec![(None, "software")];
+            if hw {
+                if let Some(h) = video::hw_decoder(&info.codec) {
+                    decoders.insert(0, (Some(h), "hardware"));
+                }
+            }
+            for (d, name) in decoders {
+                match decoder.with_input(&clip, d).benchmark(0.0, frame_bytes, 150, 10.0) {
+                    Ok(b) => {
+                        eprintln!(
+                            "    {name} decoder on that clip: first frame after {:.2}s, then {:.0} fps ({} frames; needs {need:.0})",
+                            b.first_frame, b.fps, b.frames
+                        );
+                        if d.is_some() == hw_used && b.frames > 10 && b.fps < need * 1.2 {
+                            problems.push(format!("{name} decoder too slow {label}: {:.0} fps for {need:.0} fps video", b.fps));
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("    {name} decoder on that clip: failed ({e})");
+                        if d.is_some() == hw_used {
+                            problems.push(format!("{name} decoder failed on the clip {label}: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&clip);
+    }
+
     match &audio {
         None => eprintln!("    sound: none"),
         Some(a) => {
             let at = seek_to.unwrap_or(0.0);
-            eprintln!("    opening the sound...");
-            match video::audio_check(a, at) {
-                Ok((took, lands)) => {
-                    eprintln!(
-                        "    sound: opens at {at:.0}s in {took:.2}s{}",
-                        lands
-                            .filter(|l| at > 0.0 && at - l > 0.1)
-                            .map_or(String::new(), |l| format!(" (seek lands {:.1}s early; trimmed)", at - l))
-                    );
+            eprintln!("    starting the sound at {at:.0}s...");
+            match video::audio_check(a, at, decoder.audio_start()) {
+                Ok((took, from)) => {
+                    eprintln!("    sound: plays from {from:.2}s after {took:.2}s");
                     if took > 3.0 {
-                        problems.push(format!("sound took {took:.1}s to open"));
+                        problems.push(format!("sound took {took:.1}s to start"));
+                    }
+                    if (from - at).abs() > 0.15 {
+                        problems.push(format!("sound starts at {from:.2}s instead of {at:.0}s, out of step with the picture"));
                     }
                 }
                 Err(e) => problems.push(format!("sound failed: {e}")),

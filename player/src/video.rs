@@ -34,6 +34,9 @@ pub struct VideoInfo {
     pub full_range: bool,
     /// Length in seconds, when the container says.
     pub duration: Option<f64>,
+    /// Timestamp of the input's first packet (MPEG-TS and HLS streams often
+    /// start at 1.4 s or 10 s rather than 0).
+    pub start: f64,
 }
 
 /// Run `cmd` to completion like `Command::output`, but give up (killing it)
@@ -78,7 +81,7 @@ pub fn probe(input: &str) -> Result<VideoInfo, String> {
     let out = output_within(
         Command::new(tool("ffprobe"))
         .args(["-v", "error", "-select_streams", "v:0"])
-        .args(["-show_entries", "stream=codec_name,width,height,avg_frame_rate,r_frame_rate,color_space,color_range:format=duration"])
+        .args(["-show_entries", "stream=codec_name,width,height,avg_frame_rate,r_frame_rate,color_space,color_range:format=duration,start_time"])
         .args(["-of", "default=nw=1", input]),
         30,
     )?;
@@ -105,6 +108,7 @@ pub fn probe(input: &str) -> Result<VideoInfo, String> {
         height,
         fps: rate("avg_frame_rate").or_else(|| rate("r_frame_rate")).unwrap_or(30.0),
         duration: kv.get("duration").and_then(|v| v.parse().ok()).filter(|d: &f64| *d > 0.0),
+        start: kv.get("start_time").and_then(|v| v.parse().ok()).filter(|t: &f64| t.is_finite()).unwrap_or(0.0),
         has_audio: output_within(
             Command::new(tool("ffprobe")).args([
                 "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", input,
@@ -114,6 +118,18 @@ pub fn probe(input: &str) -> Result<VideoInfo, String> {
             .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
             .unwrap_or(false),
     })
+}
+
+/// Timestamp of the first packet of `input` (0 when ffprobe can't say).
+pub fn start_time(input: &str) -> f64 {
+    output_within(
+        Command::new(tool("ffprobe")).args(["-v", "error", "-show_entries", "format=start_time", "-of", "csv=p=0", input]),
+        30,
+    )
+    .ok()
+    .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+    .filter(|t: &f64| t.is_finite())
+    .unwrap_or(0.0)
 }
 
 /// Hardware decoder for a codec, if the Frame's iris block handles it.
@@ -252,8 +268,12 @@ impl FrameSlots {
 }
 
 /// How to decode one input; worked out once, then used for every seek.
+#[derive(Clone)]
 pub struct Decoder {
     audio_input: Option<String>,
+    /// First timestamp of the sound input. ffplay seeks relative to it but
+    /// reports (and trims by) raw timestamps, so they are shifted by this.
+    audio_start: f64,
     /// Input as given to ffmpeg (web streams go through a read-ahead buffer).
     video_url: String,
     filter: Option<String>,
@@ -275,6 +295,11 @@ impl Decoder {
         let mut d = Self {
             video_url: input.to_string(),
             audio_input: audio_input.map(str::to_string),
+            audio_start: match audio_input {
+                Some(a) if a == input => info.start,
+                Some(a) => start_time(a),
+                None => 0.0,
+            },
             filter: scale.then(|| format!("scale={}:{}:flags=bilinear", out.0, out.1)),
             fps: info.fps,
             decoder: None,
@@ -332,6 +357,17 @@ impl Decoder {
 
     pub fn is_hw(&self) -> bool {
         self.decoder.is_some()
+    }
+
+    /// The same decoding, but of another input (a downloaded clip) and with
+    /// the given decoder (`None` = software).
+    pub fn with_input(&self, input: &str, decoder: Option<&'static str>) -> Decoder {
+        Decoder { video_url: input.to_string(), decoder, ..self.clone() }
+    }
+
+    /// First timestamp of the sound input (see `audio_start`).
+    pub fn audio_start(&self) -> f64 {
+        self.audio_start
     }
 
     fn decode_args(&self, start_secs: f64) -> Vec<String> {
@@ -426,12 +462,12 @@ impl Decoder {
                 // early in YouTube's audio), and plays from there; drop that
                 // part so the sound starts where the picture does.
                 a.args(["-ss", &format!("{start_secs:.3}")]);
-                a.args(["-af", &format!("atrim=start={start_secs:.3}")]);
+                a.args(["-af", &format!("atrim=start={:.3}", start_secs + self.audio_start)]);
             }
             a.arg(audio_input).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
             match a.spawn() {
                 Ok(mut c) => {
-                    let audio_clock = Arc::new(AudioClock::default());
+                    let audio_clock = Arc::new(AudioClock { offset: self.audio_start, ..Default::default() });
                     audio_clock.clone().watch(c.stderr.take().unwrap());
                     clock = Some(audio_clock);
                     Some(c)
@@ -514,32 +550,98 @@ pub struct Bench {
     pub frames: u32,
 }
 
-/// Open the sound at `start_secs` the way playback does (decoding about two
-/// seconds of it): seconds to open, and where ffplay's own seek would have
-/// started the sound before trimming.
-pub fn audio_check(input: &str, start_secs: f64) -> Result<(f64, Option<f64>), String> {
+/// Start the sound at `start_secs` exactly as playback does (ffplay, with
+/// its output sent nowhere): seconds until it plays, and the position it
+/// reports first, which should be `start_secs`.
+pub fn audio_check(input: &str, start_secs: f64, audio_start: f64) -> Result<(f64, f64), String> {
+    let mut cmd = Command::new(tool("ffplay"));
+    cmd.args(["-nodisp", "-autoexit", "-loglevel", "error", "-stats"]);
+    if start_secs > 0.0 {
+        cmd.args(["-ss", &format!("{start_secs:.3}")]);
+        cmd.args(["-af", &format!("atrim=start={:.3}", start_secs + audio_start)]);
+    }
     let started = Instant::now();
-    let out = output_within(
-        Command::new(tool("ffmpeg"))
-            .args(["-v", "error", "-nostdin"])
-            .args(["-ss", &format!("{start_secs:.3}"), "-i", input, "-vn", "-sn"])
-            .args(["-af", &format!("atrim=start={start_secs:.3}"), "-t", "2", "-f", "null", "-"]),
-        30,
+    let mut child = cmd
+        .arg(input)
+        .env("SDL_AUDIODRIVER", "dummy")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run ffplay: {e}"))?;
+    let mut stderr = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        let mut line = Vec::new();
+        while let Ok(len) = stderr.read(&mut buf) {
+            if len == 0 {
+                break;
+            }
+            for &b in &buf[..len] {
+                if b != b'\r' && b != b'\n' {
+                    line.push(b);
+                    continue;
+                }
+                let text = String::from_utf8_lossy(&line).into_owned();
+                line.clear();
+                let msg = match status_clock(&text) {
+                    Some(v) => Ok(v),
+                    None if !text.contains("fd=") && !text.trim().is_empty() => Err(text.trim().to_string()),
+                    None => continue,
+                };
+                if tx.send(msg).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    let mut said = None;
+    let result = loop {
+        match rx.recv_timeout(Duration::from_secs(30).saturating_sub(started.elapsed())) {
+            Ok(Ok(v)) => break Ok((started.elapsed().as_secs_f64(), v - audio_start)),
+            Ok(Err(text)) => said = Some(text),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break Err("no sound after 30s".to_string()),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break Err(said.take().unwrap_or_else(|| "ffplay stopped without playing".into()));
+            }
+        }
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    result.map_err(|e| match said {
+        Some(text) => format!("{e} (ffplay said: {text})"),
+        None => e,
+    })
+}
+
+/// Copy `secs` seconds of the video stream from `start_secs` into the file
+/// `out` without decoding it: how long the network takes to deliver it.
+pub fn fetch_clip(input: &str, start_secs: f64, secs: f64, out: &str) -> Result<f64, String> {
+    let started = Instant::now();
+    let mut cmd = Command::new(tool("ffmpeg"));
+    cmd.args(["-v", "error", "-nostdin", "-y"]);
+    if start_secs > 0.0 {
+        cmd.args(["-ss", &format!("{start_secs:.3}")]);
+    }
+    let o = output_within(
+        cmd.args(["-i", input, "-map", "0:v:0", "-c", "copy", "-t", &format!("{secs:.0}"), "-f", "matroska", out]),
+        60,
     )?;
-    let took = started.elapsed().as_secs_f64();
-    if !out.status.success() {
-        let msg = String::from_utf8_lossy(&out.stderr);
+    if !o.status.success() {
+        let msg = String::from_utf8_lossy(&o.stderr);
         return Err(msg.lines().last().unwrap_or("ffmpeg failed").trim().to_string());
     }
-    let lands = output_within(
-        Command::new(tool("ffprobe"))
-            .args(["-v", "error", "-select_streams", "a:0", "-read_intervals", &format!("{start_secs:.3}%+#1")])
-            .args(["-show_entries", "packet=pts_time", "-of", "csv=p=0", input]),
-        15,
-    )
-    .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).lines().next().and_then(|l| l.trim().trim_end_matches(',').parse().ok()));
-    Ok((took, lands))
+    Ok(started.elapsed().as_secs_f64())
+}
+
+/// The clock on one of ffplay's status lines, which end in "fd= ... aq= ...";
+/// before the sound starts they read "nan" and carry no clock yet.
+fn status_clock(line: &str) -> Option<f64> {
+    if !line.contains("fd=") {
+        return None;
+    }
+    line.split_whitespace().next()?.parse::<f64>().ok().filter(|v| v.is_finite())
 }
 
 /// ffplay's audio clock, read from the status line it prints every 30 ms
@@ -547,6 +649,8 @@ pub fn audio_check(input: &str, start_secs: f64) -> Result<(f64, Option<f64>), S
 #[derive(Default)]
 struct AudioClock {
     state: Mutex<ClockState>,
+    /// Subtracted from ffplay's raw timestamps (see `Decoder::audio_start`).
+    offset: f64,
 }
 
 #[derive(Default)]
@@ -583,11 +687,8 @@ impl AudioClock {
                     }
                     let text = String::from_utf8_lossy(&line).into_owned();
                     line.clear();
-                    // Status lines end in "fd= ... aq= ..."; before the sound
-                    // starts they read "nan" and carry no clock yet.
                     if text.contains("fd=") {
-                        let value = text.split_whitespace().next().and_then(|v| v.parse::<f64>().ok());
-                        if let Some(v) = value.filter(|v| v.is_finite()) {
+                        if let Some(v) = status_clock(&text).map(|v| v - self.offset) {
                             let mut s = self.state.lock().unwrap();
                             if s.value.is_none() {
                                 eprintln!("audio: playing from {v:.2}s");
